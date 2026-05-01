@@ -1,5 +1,94 @@
 # Changelog
 
+## 0.1.3 — 2026-05-01
+
+Fourth review round (two reviewers, 9 unique findings — most edge-case;
+two MEDIUM hardening items, the rest defence-in-depth). All in-scope
+items addressed.
+
+### Fixed
+
+- **resolveReceiver slowloris (MED)** — the lookup callback is now
+  wrapped in `Promise.race` against `resolveReceiverTimeoutMs` (default
+  5000ms). Slow DB / RPC stalls no longer pin request handlers
+  indefinitely. Timeout surfaces as `504 receiver_lookup_timeout`,
+  generic failure as `503 receiver_lookup_unavailable`.
+- **Unbounded upstream response body (MED)** — `upstream.text()`
+  replaced with a streaming reader that tracks accumulated bytes
+  and aborts the fetch + cancels the reader as soon as
+  `maxResponseBodyBytes` (default 1 MiB) is exceeded. Surfaces as
+  `502 upstream_body_too_large` with the cap value in the response.
+- **IPv6 zone-ID SSRF bypass (MED)** — `isPrivateOrLoopbackHost`
+  now strips `%zone` suffixes before `node:net.isIP()` so
+  `fe80::1%eth0` correctly resolves to fe80::/10 link-local
+  classification. Hostnames with `%` that don't otherwise resolve
+  to a recognised IP class are also rejected as suspect (defence
+  in depth).
+- **localhost / ip6-localhost not blocked (LOW)** — explicit
+  set-membership check at the top of `isPrivateOrLoopbackHost`
+  for `localhost`, `localhost.localdomain`, `ip6-localhost`,
+  `ip6-loopback`. Previously these passed because they're DNS
+  names, not IP literals — only the port denylist was protecting
+  http://localhost:NNN/ deployments.
+- **Default response security headers (LOW)** — `X-Frame-Options:
+  DENY`, `Content-Security-Policy: default-src 'none'; frame-ancestors
+  'none'`, `Referrer-Policy: no-referrer` now hard-coded on every
+  visitor response alongside the existing `nosniff`. Override via
+  `cfg.responseSecurityHeaders` (object merges with defaults; pass
+  `false` to disable entirely if you proxy actual HTML).
+- **`envelopeHeader` header injection (LOW)** — validated at
+  middleware construct time against `^[A-Za-z0-9_-]+$`. A caller
+  passing `'X-AAE\nX-Injected: yes'` or `'Content-Type:Bad'` now
+  throws loudly rather than silently enabling header smuggling.
+- **`logger.info` outside try/catch (LOW)** — `emitAudit` now wraps
+  every logger call (info AND the error fallback in sink-rejection
+  handling) so a logger proxy that throws on access cannot crash
+  the request handler. Audit-trail value isn't worth taking down
+  the service.
+- **Extreme `requestsPerMinute` memory blow-up (INFO)** —
+  `IpRateLimiter` constructor caps `requestsPerMinute` at 10 000
+  with a clear error pointing operators at CDN/proxy rate-limits
+  for higher capacity. Previously an unbounded value × maxBuckets
+  100k could allocate ~800 GB of timestamp memory.
+
+### Documented (no code change)
+
+- **Shared "unknown" rate-limit bucket** — when both `req.ip` and
+  `req.connection.remoteAddress` are unavailable, all such requests
+  share one bucket (fail-closed). Random fallback would let
+  attackers strip IP headers to bypass rate-limit entirely. Comment
+  added to the middleware noting the deliberate trade-off.
+
+### Tests
+
+- 89 → 107 tests passing. New coverage:
+  - `url-validation.test.js`: localhost variants, IPv6 zone-ID
+    stripping, suspect %-suffix rejection (4 new).
+  - `middleware.test.js`: resolveReceiver timeout (1), upstream
+    body cap with streaming-large response (1), default response
+    security headers (1), `responseSecurityHeaders: false` opt-out
+    (1), responseSecurityHeaders override-merge (1), envelopeHeader
+    injection patterns (1 with 4 sub-cases), maxResponseBodyBytes
+    + resolveReceiverTimeoutMs construct validation (2).
+  - `ip-rate-limit.test.js`: requestsPerMinute upper bound (1).
+  - **New file** `audit.test.js` — 6 tests covering throwing
+    logger, throwing logger proxy, sync sink throws, async sink
+    rejects, both sink and logger throw, well-behaved baseline.
+
+### Compatibility
+
+Behavioural changes:
+- Hostnames `localhost`, `localhost.localdomain`, `ip6-localhost`,
+  `ip6-loopback` now blocked by `validateReceiverUrl` even with
+  `allowedProtocols: ['http:']`. Add `allowPrivateHosts: true`
+  for tests / dev as before.
+- Responses now carry CSP/X-Frame-Options/Referrer-Policy by
+  default. If you proxy a surface that needs other framing or
+  loading semantics, override via `cfg.responseSecurityHeaders`.
+- Upstream responses larger than 1 MiB now return
+  `502 upstream_body_too_large`. Raise `maxResponseBodyBytes`
+  if your receivers legitimately stream more.
+
 ## 0.1.2 — 2026-05-01
 
 Third external review round (overlapping reviewers; 10 + 4 raw findings,

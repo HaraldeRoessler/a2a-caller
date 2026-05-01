@@ -1,6 +1,6 @@
 {
   "name": "a2a-caller",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Sender-side counterpart to a2a-acl. Express middleware that lets unauthenticated web traffic (visitors, LLM sandboxes, third-party services) reach AAE-protected agent-to-agent endpoints — your service signs envelopes on the visitor's behalf, captures their identity for audit, rate-limits per IP. Pair with a2a-acl on the receiver side.",
   "type": "module",
   "main": "src/index.js",

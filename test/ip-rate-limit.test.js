@@ -39,6 +39,15 @@ test('rejects invalid requestsPerMinute', () => {
   assert.throws(() => new IpRateLimiter({ requestsPerMinute: Infinity }), /positive number/);
 });
 
+test('rejects requestsPerMinute > 10000 to bound memory', () => {
+  assert.throws(() => new IpRateLimiter({ requestsPerMinute: 10_001 }), /must be ≤ 10000/);
+  assert.throws(() => new IpRateLimiter({ requestsPerMinute: 1_000_000 }), /must be ≤ 10000/);
+  // Boundary is inclusive
+  const rl = new IpRateLimiter({ requestsPerMinute: 10_000 });
+  assert.equal(rl.limit, 10_000);
+  rl.stop();
+});
+
 test('rejects invalid maxBuckets', () => {
   assert.throws(() => new IpRateLimiter({ requestsPerMinute: 1, maxBuckets: 0 }), /positive number/);
   assert.throws(() => new IpRateLimiter({ requestsPerMinute: 1, maxBuckets: NaN }), /positive number/);

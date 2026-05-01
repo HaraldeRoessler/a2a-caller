@@ -117,21 +117,40 @@ const DEFAULT_DENIED_PORTS = new Set([
   50000, // SAP / HANA
 ]);
 
+// Loopback hostnames operators / curl / browsers commonly resolve to
+// 127.0.0.1 or ::1. node:net.isIP() doesn't catch these (they're DNS
+// names, not IP literals). Reject them explicitly so a misconfigured
+// `allowedProtocols: ['http:']` + a buggy `resolveReceiver` returning
+// `http://localhost:9999/` can't reach a service bound to 127.0.0.1.
+const LOOPBACK_HOSTNAMES = new Set(['localhost', 'localhost.localdomain', 'ip6-localhost', 'ip6-loopback']);
+
 /**
  * Returns true if the hostname is a literal IP address in a private,
- * loopback, link-local, or "this-network" range. Hostnames that aren't
- * IP literals (regular DNS names) return false — we leave DNS-based
- * filtering to the operator's network layer.
+ * loopback, link-local, or "this-network" range — OR a well-known
+ * loopback DNS name. Regular DNS names not in the loopback set
+ * return false; DNS-based filtering for those is left to the
+ * operator's network layer.
  */
 export function isPrivateOrLoopbackHost(hostname) {
   if (typeof hostname !== 'string' || hostname.length === 0) return false;
-  const family = isIP(hostname);
+  const lower = hostname.toLowerCase();
+  if (LOOPBACK_HOSTNAMES.has(lower)) return true;
+  // IPv6 zone-ID defence: an URL like http://[fe80::1%25eth0]/ produces
+  // hostname "fe80::1%eth0" — Node's isIP() returns 0 for the zoned
+  // form and the link-local fe80::/10 prefix-check would never run.
+  // Strip the zone before isIP(); ALSO reject zoned hostnames that
+  // don't otherwise resolve to a known IP class (defence in depth).
+  const stripped = lower.includes('%') ? lower.split('%')[0] : lower;
+  const family = isIP(stripped);
   if (family === 4) {
-    return PRIVATE_V4_RANGES.some((r) => inRangeV4(hostname, r));
+    return PRIVATE_V4_RANGES.some((r) => inRangeV4(stripped, r));
   }
   if (family === 6) {
-    return isPrivateV6(hostname);
+    return isPrivateV6(stripped);
   }
+  // Hostname has a `%` suffix but doesn't resolve to a recognised IP
+  // family even after stripping — treat as suspect, block.
+  if (lower !== stripped) return true;
   return false;
 }
 

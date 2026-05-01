@@ -22,11 +22,39 @@ three groups:
   so a receiver that 3xx-redirects to a private IP cannot bypass
   `validateReceiverUrl` (which only saw the initial URL). Receivers
   must return their final URL from `resolveReceiver`.
-- **Browser MIME-sniffing of compromised receiver responses** —
-  `X-Content-Type-Options: nosniff` is hard-coded on every visitor
-  response so a receiver returning `Content-Type: text/plain` with
-  active content cannot be sniffed and executed by the visitor's
-  browser.
+- **Browser MIME-sniffing / clickjacking / referrer leakage** of
+  compromised receiver responses — `X-Content-Type-Options: nosniff`,
+  `X-Frame-Options: DENY`, `Content-Security-Policy: default-src
+  'none'; frame-ancestors 'none'`, and `Referrer-Policy: no-referrer`
+  are all hard-coded on every visitor response. Override via
+  `cfg.responseSecurityHeaders` if you proxy actual HTML.
+- **Slowloris via slow `resolveReceiver` callback** — the lookup is
+  wrapped in a `Promise.race` against `resolveReceiverTimeoutMs`
+  (default 5s). Returns `504 receiver_lookup_timeout` rather than
+  pinning the request handler.
+- **Unbounded upstream response body** — response is read with a
+  streaming reader and aborted at `maxResponseBodyBytes` (default
+  1 MiB). Returns `502 upstream_body_too_large`. Defends against
+  a fast malicious upstream streaming multi-GB inside the
+  forward-timeout window.
+- **IPv6 zone-ID SSRF bypass** — `fe80::1%eth0` and similar zoned
+  IPv6 forms have their `%zone` stripped before `isIP()` so the
+  fe80::/10 link-local prefix check still fires. Hostnames with
+  `%` that don't otherwise resolve to a recognised IP class are
+  also blocked.
+- **localhost / ip6-localhost SSRF** — explicit set-membership
+  check on `localhost`, `localhost.localdomain`, `ip6-localhost`,
+  `ip6-loopback` (these are DNS names, not IP literals, so the
+  IP-range check alone wouldn't catch them).
+- **Header injection via `envelopeHeader` config** — validated at
+  construct time against `^[A-Za-z0-9_-]+$`. Newlines / colons /
+  control chars throw loudly rather than enabling HTTP smuggling.
+- **Logger-failure crash propagation** — `emitAudit` wraps every
+  logger call in try/catch. A misbehaving logger proxy cannot crash
+  the request handler.
+- **Extreme `requestsPerMinute` memory blow-up** — capped at 10 000
+  at `IpRateLimiter` construct time. Higher capacity belongs in a
+  CDN / proxy rate-limit, not in-process bucket arrays.
 - **Replay against another receiver** — `sub = receiver.did` is set
   on every envelope, the receiver-side `expectedSub` check rejects
   envelopes captured for one peer and replayed against another.

@@ -449,3 +449,166 @@ test('SSRF defence: URL with embedded credentials → 404', async () => {
   assert.equal(r.status, 404);
   await app.close();
 });
+
+test('resolveReceiver timeout → 504', async () => {
+  const { seed } = freshKeypair();
+  const app = await startApp(publicChatMiddleware({
+    resolveReceiver: async () => new Promise(() => { /* hang forever */ }),
+    callerDid: 'did:moltrust:p',
+    signingKey: { key: loadSigningKey(seed) },
+    callerSigKeyId: 'k',
+    requestsPerMinute: 100,
+    resolveReceiverTimeoutMs: 50,
+  }));
+  const r = await fetch(`${app.baseUrl}/v1/chat/x`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(r.status, 504);
+  const json = await r.json();
+  assert.equal(json.error, 'receiver_lookup_timeout');
+  await app.close();
+});
+
+test('upstream body cap: oversized response → 502 upstream_body_too_large', async () => {
+  const { seed } = freshKeypair();
+  // Mock receiver that streams a >maxResponseBodyBytes payload.
+  const bigServer = createServer((_req, res) => {
+    res.statusCode = 200;
+    res.setHeader('content-type', 'application/json');
+    // 2 MiB of 'A's — well above the 100 KiB cap we'll set below.
+    res.end('"' + 'A'.repeat(2 * 1024 * 1024) + '"');
+  });
+  await new Promise((r) => bigServer.listen(0, '127.0.0.1', r));
+  const { port } = bigServer.address();
+
+  const app = await startApp(publicChatMiddleware({
+    resolveReceiver: async () => ({
+      did: 'did:moltrust:t',
+      url: `http://127.0.0.1:${port}/api/a2a/message`,
+    }),
+    callerDid: 'did:moltrust:p',
+    signingKey: { key: loadSigningKey(seed) },
+    callerSigKeyId: 'k',
+    requestsPerMinute: 100,
+    allowPrivateHosts: true,
+    allowedProtocols: ['http:'],
+    maxResponseBodyBytes: 100 * 1024,    // 100 KiB cap
+  }));
+  const r = await fetch(`${app.baseUrl}/v1/chat/x`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(r.status, 502);
+  const json = await r.json();
+  assert.equal(json.error, 'upstream_body_too_large');
+  assert.equal(json.max_bytes, 100 * 1024);
+  await app.close();
+  await new Promise((r) => bigServer.close(r));
+});
+
+test('response carries CSP + X-Frame-Options + Referrer-Policy by default', async () => {
+  const { seed, pubB64url } = freshKeypair();
+  const recv = await startMockReceiver(pubB64url, () => 'did:moltrust:t');
+  const app = await startApp(publicChatMiddleware({
+    resolveReceiver: async () => ({ did: 'did:moltrust:t', url: recv.url }),
+    callerDid: 'did:moltrust:p',
+    signingKey: { key: loadSigningKey(seed) },
+    callerSigKeyId: 'caller-v1',
+    requestsPerMinute: 100,
+    allowPrivateHosts: true,
+    allowedProtocols: ['http:'],
+  }));
+  const r = await fetch(`${app.baseUrl}/v1/chat/x`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(r.headers.get('x-frame-options'), 'DENY');
+  assert.equal(r.headers.get('content-security-policy'), "default-src 'none'; frame-ancestors 'none'");
+  assert.equal(r.headers.get('referrer-policy'), 'no-referrer');
+  assert.equal(r.headers.get('x-content-type-options'), 'nosniff');
+  await app.close();
+  await recv.close();
+});
+
+test('responseSecurityHeaders:false disables defaults', async () => {
+  const { seed, pubB64url } = freshKeypair();
+  const recv = await startMockReceiver(pubB64url, () => 'did:moltrust:t');
+  const app = await startApp(publicChatMiddleware({
+    resolveReceiver: async () => ({ did: 'did:moltrust:t', url: recv.url }),
+    callerDid: 'did:moltrust:p',
+    signingKey: { key: loadSigningKey(seed) },
+    callerSigKeyId: 'caller-v1',
+    requestsPerMinute: 100,
+    allowPrivateHosts: true,
+    allowedProtocols: ['http:'],
+    responseSecurityHeaders: false,
+  }));
+  const r = await fetch(`${app.baseUrl}/v1/chat/x`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(r.headers.get('x-frame-options'), null);
+  assert.equal(r.headers.get('content-security-policy'), null);
+  assert.equal(r.headers.get('x-content-type-options'), null);
+  await app.close();
+  await recv.close();
+});
+
+test('responseSecurityHeaders object overrides individual defaults', async () => {
+  const { seed, pubB64url } = freshKeypair();
+  const recv = await startMockReceiver(pubB64url, () => 'did:moltrust:t');
+  const app = await startApp(publicChatMiddleware({
+    resolveReceiver: async () => ({ did: 'did:moltrust:t', url: recv.url }),
+    callerDid: 'did:moltrust:p',
+    signingKey: { key: loadSigningKey(seed) },
+    callerSigKeyId: 'caller-v1',
+    requestsPerMinute: 100,
+    allowPrivateHosts: true,
+    allowedProtocols: ['http:'],
+    responseSecurityHeaders: { 'X-Frame-Options': 'SAMEORIGIN' },
+  }));
+  const r = await fetch(`${app.baseUrl}/v1/chat/x`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(r.headers.get('x-frame-options'), 'SAMEORIGIN');
+  // Other defaults still present
+  assert.equal(r.headers.get('x-content-type-options'), 'nosniff');
+  await app.close();
+  await recv.close();
+});
+
+test('config validation: envelopeHeader with invalid chars → throw', () => {
+  const { seed } = freshKeypair();
+  for (const bad of ['Content-Type:Bad', 'X-AAE\nX-Injected: yes', 'X-AAE Hi', '']) {
+    assert.throws(
+      () => publicChatMiddleware({
+        resolveReceiver: async () => null,
+        callerDid: 'did:x:1', signingKey: { key: loadSigningKey(seed) }, callerSigKeyId: 'k',
+        envelopeHeader: bad,
+      }),
+      /envelopeHeader/,
+      `must reject envelopeHeader=${JSON.stringify(bad)}`,
+    );
+  }
+});
+
+test('config validation: maxResponseBodyBytes must be a positive integer', () => {
+  const { seed } = freshKeypair();
+  assert.throws(
+    () => publicChatMiddleware({
+      resolveReceiver: async () => null,
+      callerDid: 'did:x:1', signingKey: { key: loadSigningKey(seed) }, callerSigKeyId: 'k',
+      maxResponseBodyBytes: 0,
+    }),
+    /maxResponseBodyBytes/,
+  );
+});
+
+test('config validation: resolveReceiverTimeoutMs must be a positive number', () => {
+  const { seed } = freshKeypair();
+  assert.throws(
+    () => publicChatMiddleware({
+      resolveReceiver: async () => null,
+      callerDid: 'did:x:1', signingKey: { key: loadSigningKey(seed) }, callerSigKeyId: 'k',
+      resolveReceiverTimeoutMs: 0,
+    }),
+    /resolveReceiverTimeoutMs/,
+  );
+});

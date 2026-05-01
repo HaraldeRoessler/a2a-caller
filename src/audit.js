@@ -50,17 +50,30 @@ export function emitAudit({ sink, logger = null, row }) {
   if (typeof sink === 'function') {
     try {
       Promise.resolve(sink(row)).catch((err) => {
-        logger?.error?.(
-          { err: err?.message ?? String(err), row },
-          'audit sink rejected — public-chat audit trail has gaps',
-        );
+        // Wrap the .error?.() call too — a logger proxy that throws
+        // on .error access would otherwise re-throw inside an async
+        // chain and surface as an unhandled rejection.
+        try {
+          logger?.error?.(
+            { err: err?.message ?? String(err), row },
+            'audit sink rejected — public-chat audit trail has gaps',
+          );
+        } catch { /* logger threw too — give up silently */ }
       });
     } catch (err) {
-      logger?.error?.(
-        { err: err?.message ?? String(err), row },
-        'audit sink threw — public-chat audit trail has gaps',
-      );
+      try {
+        logger?.error?.(
+          { err: err?.message ?? String(err), row },
+          'audit sink threw — public-chat audit trail has gaps',
+        );
+      } catch { /* logger threw too — give up silently */ }
     }
   }
-  logger?.info?.(row, 'public-chat request');
+  // logger.info() can throw if the caller passed a malicious /
+  // mis-implemented logger proxy. Don't let that crash the request
+  // handler — the audit trail's value isn't worth taking down the
+  // service over.
+  try {
+    logger?.info?.(row, 'public-chat request');
+  } catch { /* swallow logger failures */ }
 }

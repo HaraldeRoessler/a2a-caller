@@ -20,6 +20,15 @@ export class IpRateLimiter {
     if (!Number.isFinite(requestsPerMinute) || requestsPerMinute <= 0) {
       throw new Error('requestsPerMinute must be a positive number');
     }
+    // Cap requestsPerMinute at a sane upper bound. Each bucket is an
+    // array of timestamps; with maxBuckets=100k and an unbounded
+    // requestsPerMinute, an operator passing 1M could accidentally
+    // allocate ~800GB of timestamp memory. 10k requests/min/IP is
+    // absurd in practice — anyone needing more should layer a
+    // CDN/proxy rate-limit in front rather than crank this knob.
+    if (requestsPerMinute > 10_000) {
+      throw new Error('requestsPerMinute must be ≤ 10000 — for higher capacity, layer a CDN/proxy rate limit in front');
+    }
     if (!Number.isFinite(maxBuckets) || maxBuckets <= 0) {
       throw new Error('maxBuckets must be a positive number');
     }

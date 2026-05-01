@@ -42,7 +42,25 @@ test('isPrivateOrLoopbackHost: IPv4-mapped IPv6 catches private v4', () => {
 test('isPrivateOrLoopbackHost: regular hostnames return false (DNS check is operator responsibility)', () => {
   assert.equal(isPrivateOrLoopbackHost('example.com'), false);
   assert.equal(isPrivateOrLoopbackHost('agent.ownify.ai'), false);
-  assert.equal(isPrivateOrLoopbackHost('localhost'), false, 'literal localhost name not in IP ranges — relies on protocol/allowlist');
+});
+
+test('isPrivateOrLoopbackHost: localhost variants explicitly blocked', () => {
+  assert.equal(isPrivateOrLoopbackHost('localhost'), true);
+  assert.equal(isPrivateOrLoopbackHost('LOCALHOST'), true);
+  assert.equal(isPrivateOrLoopbackHost('localhost.localdomain'), true);
+  assert.equal(isPrivateOrLoopbackHost('ip6-localhost'), true);
+  assert.equal(isPrivateOrLoopbackHost('ip6-loopback'), true);
+});
+
+test('isPrivateOrLoopbackHost: IPv6 zone-ID stripped before isIP — link-local still blocked', () => {
+  // fe80::1%eth0 is fe80::/10 link-local, must be rejected.
+  assert.equal(isPrivateOrLoopbackHost('fe80::1%eth0'), true);
+  assert.equal(isPrivateOrLoopbackHost('::1%lo0'), true);
+});
+
+test('isPrivateOrLoopbackHost: hostname with %suffix that is NOT a recognised IP is also rejected', () => {
+  // Defence in depth — anything zoned that isn't a clean IP is suspect.
+  assert.equal(isPrivateOrLoopbackHost('example.com%foo'), true);
 });
 
 test('isPrivateOrLoopbackHost: malformed input returns false', () => {

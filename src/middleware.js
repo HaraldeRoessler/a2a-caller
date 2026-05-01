@@ -33,8 +33,29 @@ import { validateReceiverUrl } from './url-validation.js';
 const DEFAULT_AUD = 'a2a-ingress';
 const DEFAULT_HEADER_NAME = 'X-AAE';
 const DEFAULT_FORWARD_TIMEOUT_MS = 30_000;
-const DEFAULT_MAX_BODY_BYTES = 64 * 1024;          // 64 KiB hard cap
+const DEFAULT_RESOLVE_RECEIVER_TIMEOUT_MS = 5_000;
+const DEFAULT_MAX_BODY_BYTES = 64 * 1024;          // 64 KiB request body cap
+const DEFAULT_MAX_RESPONSE_BODY_BYTES = 1 * 1024 * 1024;  // 1 MiB response body cap
 const DEFAULT_ALLOWED_PROTOCOLS = ['https:'];
+
+// Accepts standard HTTP-token-flavoured header names. RFC 7230 token
+// chars are broader, but for envelope headers we only need
+// alphanumerics + '-' + '_'. Restrictive enough to refuse smuggling
+// attempts (newlines, colons, control chars) without false-positives
+// on real-world envelope header names like X-AAE / X-Klaw-AAE.
+const HEADER_NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
+
+// Default browser-hardening headers on the visitor-facing response.
+// `default-src 'none'` on CSP is the strictest possible — blocks
+// scripts, images, fetch, frames, etc. Appropriate for an API surface
+// being proxied. If you proxy actual HTML through this middleware
+// (rare), pass `responseSecurityHeaders: false` or a custom object.
+const DEFAULT_RESPONSE_SECURITY_HEADERS = Object.freeze({
+  'X-Content-Type-Options': 'nosniff',
+  'X-Frame-Options': 'DENY',
+  'Content-Security-Policy': "default-src 'none'; frame-ancestors 'none'",
+  'Referrer-Policy': 'no-referrer',
+});
 
 // Same shape the receiver-side a2a-acl validates — keep them locally
 // so we don't depend on caller-id.js's regex (which is for header
@@ -107,17 +128,42 @@ export function publicChatMiddleware(cfg) {
   const envelopeHeader = cfg.envelopeHeader ?? DEFAULT_HEADER_NAME;
   const sanitiseEnabled = cfg.sanitise !== false;
   const forwardTimeoutMs = cfg.forwardTimeoutMs ?? DEFAULT_FORWARD_TIMEOUT_MS;
+  const resolveReceiverTimeoutMs = cfg.resolveReceiverTimeoutMs ?? DEFAULT_RESOLVE_RECEIVER_TIMEOUT_MS;
   const maxBodyBytes = cfg.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
+  const maxResponseBodyBytes = cfg.maxResponseBodyBytes ?? DEFAULT_MAX_RESPONSE_BODY_BYTES;
   const callerIdOpts = cfg.callerIdOpts ?? {};
   const logger = cfg.logger ?? null;
   const urlValidationOpts = {
     allowedReceiverHosts: cfg.allowedReceiverHosts,
+    allowedReceiverPorts: cfg.allowedReceiverPorts,
+    deniedReceiverPorts: cfg.deniedReceiverPorts,
     allowedProtocols: cfg.allowedProtocols ?? DEFAULT_ALLOWED_PROTOCOLS,
     allowPrivateHosts: cfg.allowPrivateHosts === true,
   };
+  // Compose response security headers. `false` opts out entirely
+  // (operator's choice); an object merges with defaults so callers
+  // can override one header without losing the others.
+  let responseSecurityHeaders;
+  if (cfg.responseSecurityHeaders === false) {
+    responseSecurityHeaders = {};
+  } else if (cfg.responseSecurityHeaders && typeof cfg.responseSecurityHeaders === 'object') {
+    responseSecurityHeaders = { ...DEFAULT_RESPONSE_SECURITY_HEADERS, ...cfg.responseSecurityHeaders };
+  } else {
+    responseSecurityHeaders = { ...DEFAULT_RESPONSE_SECURITY_HEADERS };
+  }
 
+  // Construct-time validation
+  if (!HEADER_NAME_PATTERN.test(envelopeHeader)) {
+    throw new Error(`cfg.envelopeHeader must match ${HEADER_NAME_PATTERN} — newlines/colons/control chars enable header injection`);
+  }
   if (!Number.isInteger(maxBodyBytes) || maxBodyBytes <= 0) {
     throw new Error('cfg.maxBodyBytes must be a positive integer');
+  }
+  if (!Number.isInteger(maxResponseBodyBytes) || maxResponseBodyBytes <= 0) {
+    throw new Error('cfg.maxResponseBodyBytes must be a positive integer');
+  }
+  if (!Number.isFinite(resolveReceiverTimeoutMs) || resolveReceiverTimeoutMs <= 0) {
+    throw new Error('cfg.resolveReceiverTimeoutMs must be a positive number');
   }
 
   return async function publicChat(req, res) {
@@ -126,13 +172,29 @@ export function publicChatMiddleware(cfg) {
       return res.status(400).json({ error: 'missing_slug' });
     }
 
-    // 1. Receiver lookup
+    // 1. Receiver lookup. Wrapped in a hard timeout so a slow callback
+    //    (DB stall, RPC hang) can't pin a request handler indefinitely
+    //    — slowloris-style DoS via the resolveReceiver path.
     let receiver;
     try {
-      receiver = await cfg.resolveReceiver(slug);
+      let timer;
+      const timeoutP = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('resolveReceiver_timeout')), resolveReceiverTimeoutMs);
+      });
+      try {
+        receiver = await Promise.race([
+          Promise.resolve(cfg.resolveReceiver(slug)),
+          timeoutP,
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
     } catch (err) {
-      logger?.error?.({ err: err?.message, slug }, 'resolveReceiver threw');
-      return res.status(503).json({ error: 'receiver_lookup_unavailable' });
+      const isTimeout = err?.message === 'resolveReceiver_timeout';
+      logger?.error?.({ err: err?.message, slug, timeout: isTimeout }, 'resolveReceiver failed');
+      return res.status(isTimeout ? 504 : 503).json({
+        error: isTimeout ? 'receiver_lookup_timeout' : 'receiver_lookup_unavailable',
+      });
     }
     if (!receiver) {
       return res.status(404).json({ error: 'receiver_not_found' });
@@ -160,6 +222,12 @@ export function publicChatMiddleware(cfg) {
     // proxy is enabled. Deploy behind a reverse proxy you control and
     // set trust proxy to that proxy's exact CIDR — never `true`
     // blindly. See README.md.
+    //
+    // The 'unknown' fallback fires only if Express has no IP info at
+    // all (broken / very unusual deployment). All such requests
+    // share one rate-limit bucket — fail-closed by design. The
+    // alternative (random per-request fallback) would let attackers
+    // strip IP headers to bypass rate-limit entirely.
     const ip = req.ip ?? req.connection?.remoteAddress ?? 'unknown';
     const rlKey = IpRateLimiter.keyOf(ip, slug);
     if (!rateLimiter.consume(rlKey)) {
@@ -249,9 +317,39 @@ export function publicChatMiddleware(cfg) {
         redirect: 'error',
       });
       upstreamStatus = upstream.status;
-      upstreamBody = await upstream.text();
+      // Stream-read the response body with a hard size cap. text()
+      // would buffer the entire response; a fast malicious upstream
+      // can stream multi-GB inside the forward timeout and exhaust
+      // process memory. Abort the fetch as soon as the cap is hit.
+      const reader = upstream.body?.getReader?.();
+      if (reader) {
+        const chunks = [];
+        let total = 0;
+        let truncated = false;
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          total += value.length;
+          if (total > maxResponseBodyBytes) {
+            try { ac.abort(); } catch { /* ignore */ }
+            try { await reader.cancel(); } catch { /* ignore */ }
+            truncated = true;
+            break;
+          }
+          chunks.push(value);
+        }
+        if (truncated) {
+          throw new Error('upstream_body_too_large');
+        }
+        upstreamBody = Buffer.concat(chunks).toString('utf8');
+      } else {
+        // No streaming body (e.g. HEAD-style upstream). Empty body.
+        upstreamBody = '';
+      }
     } catch (err) {
-      logger?.error?.({ err: err?.message, slug, url: validatedUrl }, 'forward to receiver failed');
+      const tooLarge = err?.message === 'upstream_body_too_large';
+      logger?.error?.({ err: err?.message, slug, url: validatedUrl, tooLarge }, 'forward to receiver failed');
       emitAudit({
         sink: cfg.sink, logger,
         row: buildAuditRow({
@@ -261,10 +359,13 @@ export function publicChatMiddleware(cfg) {
           visitorHash: callerId.visitor_hash,
           client: callerId.client,
           jti: extractJtiFromEnvelope(envelope),
-          upstreamStatus: 0,
+          upstreamStatus: tooLarge ? upstreamStatus : 0,
         }),
       });
-      return res.status(502).json({ error: 'receiver_unreachable' });
+      return res.status(502).json({
+        error: tooLarge ? 'upstream_body_too_large' : 'receiver_unreachable',
+        ...(tooLarge ? { max_bytes: maxResponseBodyBytes } : {}),
+      });
     } finally {
       clearTimeout(timer);
     }
@@ -279,7 +380,9 @@ export function publicChatMiddleware(cfg) {
     //    content can't be MIME-sniffed and executed by the visitor's
     //    browser.
     res.status(clampHttpStatus(upstreamStatus));
-    res.setHeader('X-Content-Type-Options', 'nosniff');
+    for (const [name, value] of Object.entries(responseSecurityHeaders)) {
+      res.setHeader(name, value);
+    }
     const ct = upstream.headers.get('content-type');
     if (ct) res.setHeader('content-type', ct);
     res.send(upstreamBody);
