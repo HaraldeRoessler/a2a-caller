@@ -8,7 +8,7 @@
     ".": "./src/index.js"
   },
   "files": [
-    "src/",
+    "src/**/*.js",
     "README.md",
     "LICENSE",
     "SECURITY.md",
