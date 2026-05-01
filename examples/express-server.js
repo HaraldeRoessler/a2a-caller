@@ -13,13 +13,24 @@ import { generateKeyPairSync } from 'node:crypto';
 import { verifyAae, NonceCache, KeyResolver, RevocationChecker } from 'a2a-acl';
 import { publicChatMiddleware, loadSigningKey, IpRateLimiter } from '../src/index.js';
 
-// 1. Generate a fresh signing keypair for the portal. In production
-//    this lives in a Secret + is loaded once at startup.
+// ============================================================================
+//   ⚠ DEMO ONLY — NEVER RUN THIS BLOCK IN PRODUCTION ⚠
+//
+//   We generate an Ed25519 keypair on every startup so the example is
+//   self-contained. In production:
+//     - the seed lives in a Secret / KMS / encrypted env var
+//     - it is loaded ONCE at startup via loadSigningKey(seed)
+//     - it is rotated by minting a new key and switching the
+//       callerSigKeyId, NOT by regenerating in process
+//     - if you copy this snippet into a real deployment you have
+//       given every restart a fresh identity, broken every receiver's
+//       cached pubkey lookup, and lost the ability to revoke past keys
+// ============================================================================
 const { privateKey, publicKey } = generateKeyPairSync('ed25519');
 const seed = privateKey.export({ format: 'der', type: 'pkcs8' }).subarray(-32);
 const pubB64url = publicKey.export({ format: 'der', type: 'spki' })
   .subarray(-32).toString('base64')
-  .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  .replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
 
 // 2. Stand up a mock RECEIVER on port 4500. In production this is
 //    your tenant's a2a-acl-protected agent gateway.
@@ -54,7 +65,11 @@ receiver.listen(4500, () => console.log('mock receiver listening on http://127.0
 // 3. Stand up the PORTAL on port 4400.
 const portal = express();
 portal.use(express.json({ limit: '64kb' }));
-portal.set('trust proxy', true);
+// IMPORTANT: trust proxy MUST be a specific list of CIDRs you control,
+// never `true` (which trusts every hop blindly). With `true`, an
+// attacker can spoof X-Forwarded-For on every request and bypass the
+// per-IP rate limiter completely. This demo binds to loopback only.
+portal.set('trust proxy', 'loopback');
 
 portal.post('/v1/chat/:slug', publicChatMiddleware({
   resolveReceiver: async (slug) => {
@@ -68,6 +83,12 @@ portal.post('/v1/chat/:slug', publicChatMiddleware({
   signingKey: { key: loadSigningKey(seed) },
   callerSigKeyId: 'demo-portal-v1',
   rateLimiter: new IpRateLimiter({ requestsPerMinute: 30 }),
+  // SSRF defence: explicitly allow http (demo only) AND localhost.
+  // Production deployments should drop these flags entirely so the
+  // library defaults (https-only, private hosts blocked) apply, and
+  // optionally pass `allowedReceiverHosts: ['agent.example.com']`.
+  allowedProtocols: ['http:', 'https:'],
+  allowPrivateHosts: true,
   sink: (row) => console.log('AUDIT', JSON.stringify(row)),
   logger: console,
 }));

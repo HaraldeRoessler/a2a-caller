@@ -155,6 +155,49 @@ test('signEnvelope generates a unique jti per call', () => {
   assert.notEqual(e1, e2, 'consecutive envelopes must differ (random jti)');
 });
 
+test('signEnvelope rejects negative hop', () => {
+  const { seed } = freshKeypair();
+  const key = { key: loadSigningKey(seed) };
+  assert.throws(
+    () => signEnvelope({ iss: 'did:x:1', aud: 'a', sig_key_id: 'k', hop: -1 }, key),
+    /hop must be an integer/,
+  );
+});
+
+test('signEnvelope rejects non-integer hop', () => {
+  const { seed } = freshKeypair();
+  const key = { key: loadSigningKey(seed) };
+  assert.throws(
+    () => signEnvelope({ iss: 'did:x:1', aud: 'a', sig_key_id: 'k', hop: 1.5 }, key),
+    /hop must be an integer/,
+  );
+  assert.throws(
+    () => signEnvelope({ iss: 'did:x:1', aud: 'a', sig_key_id: 'k', hop: NaN }, key),
+    /hop must be an integer/,
+  );
+  assert.throws(
+    () => signEnvelope({ iss: 'did:x:1', aud: 'a', sig_key_id: 'k', hop: Infinity }, key),
+    /hop must be an integer/,
+  );
+});
+
+test('signEnvelope rejects hop > MAX_HOP_COUNT', () => {
+  const { seed } = freshKeypair();
+  const key = { key: loadSigningKey(seed) };
+  assert.throws(
+    () => signEnvelope({ iss: 'did:x:1', aud: 'a', sig_key_id: 'k', hop: 1000 }, key),
+    /hop must be an integer/,
+  );
+});
+
+test('signEnvelope accepts valid hop in range', () => {
+  const { seed } = freshKeypair();
+  const key = { key: loadSigningKey(seed) };
+  assert.ok(signEnvelope({ iss: 'did:x:1', aud: 'a', sig_key_id: 'k', hop: 0 }, key));
+  assert.ok(signEnvelope({ iss: 'did:x:1', aud: 'a', sig_key_id: 'k', hop: 5 }, key));
+  assert.ok(signEnvelope({ iss: 'did:x:1', aud: 'a', sig_key_id: 'k', hop: 10 }, key));
+});
+
 test('signEnvelope honours a caller-supplied jti', () => {
   const { seed } = freshKeypair();
   const key = { key: loadSigningKey(seed) };

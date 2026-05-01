@@ -66,6 +66,11 @@ export class IpRateLimiter {
   }
 
   sweep() {
+    // Early-exit when there's nothing to do. Avoids a tight Map
+    // iteration on every interval tick when the limiter is idle —
+    // matters for long-lived processes that import the library but
+    // don't hit the chat path.
+    if (this.buckets.size === 0) return;
     const cutoff = Date.now() - this.windowMs;
     for (const [k, bucket] of this.buckets) {
       if (bucket.length > 0 && bucket[0] < cutoff) {

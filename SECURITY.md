@@ -9,31 +9,62 @@ three groups:
 
 ### Defended
 
+- **SSRF via attacker-controlled receiver URLs** — `receiver.url` is
+  parsed and validated before any `fetch()`. Default policy: https
+  only, literal private/loopback/link-local/cloud-metadata IPs
+  rejected. Optional `allowedReceiverHosts` allowlist tightens to
+  exact hostnames or `*.example.com` wildcards. See README's
+  "Deployment requirements" for the DNS-rebinding caveat.
 - **Replay against another receiver** — `sub = receiver.did` is set
   on every envelope, the receiver-side `expectedSub` check rejects
   envelopes captured for one peer and replayed against another.
 - **Long-lived envelopes** — hard 5-minute lifetime cap; longer
   envelopes throw at signing time.
+- **Outsized hop counts** — `claims.hop` validated as integer in
+  `[0, 10]`; defends against `Infinity`/`NaN` slipping past the
+  receiver-side `depthGuard` cap.
+- **Oversized request bodies** — `maxBodyBytes` default 64 KiB.
+  Overflow returns 413 before signing or forwarding.
+- **Slow upstream** — `forwardTimeoutMs` (default 30s) bounds the
+  ENTIRE upstream call including body read; clearTimeout fires in
+  `finally` so the timer covers both phases.
 - **Spoofed `X-Caller-DID` headers** — shape-validated against a
   strict DID regex with a 256-char length cap. Audit-only signal
   by design; not used for authorization.
+- **Malformed receiver.did** — DID shape validated before signing
+  so junk doesn't end up in the envelope `sub` claim.
+- **Slug enumeration via status code** — unknown slugs and
+  malformed-receiver-callback both return `404 receiver_not_found`,
+  preventing attackers from probing slug existence.
+- **Status-handling crash on garbage upstream** — non-standard HTTP
+  status codes from a broken receiver clamp to 502 rather than
+  throwing in `res.status()`.
 - **Oversized client labels / DIDs in audit** — collapsed to `null`
   before insertion so audit logs stay clean.
 - **IP-flood DoS on the public chat path** — per-`(ip, slug)`
   sliding window with bucket-count cap. Under flood the rate-limiter
-  evicts oldest buckets rather than growing memory unboundedly;
-  trade-off is documented in code.
+  evicts oldest buckets rather than growing memory unboundedly.
 - **Audit-trail gaps from sink failures** — sink rejections are logged
   at error level, not warn (a missing audit row is a security signal).
-- **Slow upstream** — `forwardTimeoutMs` (default 30s) bounds receiver
-  call duration so an unresponsive receiver can't pin a request handler.
 
 ### NOT defended
 
-- **Network egress** — if your portal can reach an attacker-controlled
-  URL via `resolveReceiver`, it will sign an envelope and POST there.
-  Validate `receiver.url` in your callback (allowlist hosts,
-  reject non-HTTPS in production).
+- **DNS rebinding** — the SSRF defence checks the URL's hostname IP
+  literal at validation time. A hostname that resolves to a public IP
+  at check-time and a private IP at fetch-time will bypass the check.
+  Mitigate at the network layer (forward proxy that re-validates per
+  connection) or by resolving once and passing a literal IP to fetch.
+- **Multi-replica rate-limit bypass** — `IpRateLimiter` keeps state
+  per process. Across N replicas behind a load balancer, an attacker
+  effectively gets `N × requestsPerMinute` capacity. Layer a
+  CDN/reverse-proxy rate limit in front, or implement a Redis-backed
+  limiter with the same `consume(key)` shape and pass it via
+  `cfg.rateLimiter`. Documented in README "Deployment requirements".
+- **`X-Forwarded-For` spoofing without a controlled reverse proxy** —
+  if you set Express `trust proxy: true` (or omit a proxy entirely),
+  any client can forge `X-Forwarded-For` and bypass the per-IP rate
+  limit. The library reads `req.ip` directly. README "Deployment
+  requirements" spells out the correct setup.
 - **SQL injection in `resolveReceiver`** — your callback, your
   responsibility. Parameterise queries.
 - **Prompt injection beyond the known marker set** — `sanitiseDeep`
@@ -45,6 +76,11 @@ three groups:
   For deployments that genuinely need cryptographic guarantees across
   replicas, use a shared NonceCache implementation; the library doesn't
   ship one.
+- **Tarball provenance** — npm `--provenance` is enabled in
+  `publishConfig` but only takes effect when published from a
+  GitHub Actions workflow with `id-token: write` permissions.
+  Until that workflow lands (post-0.1.x), consumers should pin to
+  the exact resolved version in their lockfiles.
 - **Side-channel timing on signing** — Ed25519 signing time is
   message-length-bounded but not constant-time across all
   implementations. Acceptable for receiver-side trust decisions

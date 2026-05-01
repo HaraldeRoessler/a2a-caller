@@ -22,3 +22,4 @@ export { IpRateLimiter } from './ip-rate-limit.js';
 export { captureCallerId, parseClaimedDid, hashVisitor } from './caller-id.js';
 export { buildAuditRow, emitAudit } from './audit.js';
 export { publicChatMiddleware } from './middleware.js';
+export { validateReceiverUrl, isPrivateOrLoopbackHost } from './url-validation.js';

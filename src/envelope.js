@@ -22,6 +22,11 @@ import { signablePayload, SIGNED_FIELDS } from 'a2a-acl';
 const DEFAULT_LIFETIME_SEC = 300; // 5 minutes — matches a2a-acl's maxLifetimeSec
 const MAX_LIFETIME_SEC = 300;     // hard cap; longer envelopes get rejected by verifier
 const MIN_LIFETIME_SEC = 5;       // sub-5s envelopes are likely a clock-skew bug
+// Hop count cap. AAE chains with hop > MAX_HOP_COUNT are rejected by
+// the receiver-side a2a-acl (default depthGuard maxHopCount: 3) — but
+// defend in depth here so a malicious caller can't build an envelope
+// with hop = 1e9 that the verifier still accepts as a finite number.
+const MAX_HOP_COUNT = 10;
 
 // Wrap a raw 32-byte Ed25519 seed in PKCS8 DER so Node's crypto.createPrivateKey can consume it.
 const PKCS8_HEADER = Buffer.from('302e020100300506032b657004220420', 'hex');
@@ -109,6 +114,16 @@ export function signEnvelope(claims, keyMaterial, opts = {}) {
   // intentionally call signablePayload from a2a-acl so the bytes we
   // sign equal the bytes the verifier hashes. Adding/removing fields
   // requires a coordinated bump in both libraries.
+  // Hop validation. claims.hop default is 0; if the caller supplies
+  // one it MUST be a non-negative integer ≤ MAX_HOP_COUNT. NaN/Infinity/
+  // negative would either bypass the verifier's depthGuard (NaN > x is
+  // always false) or be silently capped by the verifier — fail loudly
+  // here instead.
+  let hop = claims.hop ?? 0;
+  if (!Number.isInteger(hop) || hop < 0 || hop > MAX_HOP_COUNT) {
+    throw new Error(`claims.hop must be an integer between 0 and ${MAX_HOP_COUNT}`);
+  }
+
   const env = {
     v: 1,
     iss: claims.iss,
@@ -118,7 +133,7 @@ export function signEnvelope(claims, keyMaterial, opts = {}) {
     jti: claims.jti ?? b64url(randomBytes(16)),
     sig_key_id: claims.sig_key_id,
     sig_alg: 'Ed25519',
-    hop: claims.hop ?? 0,
+    hop,
   };
   if (claims.sub != null) env.sub = claims.sub;
   if (claims.perm != null) env.perm = claims.perm;

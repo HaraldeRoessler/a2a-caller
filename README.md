@@ -120,9 +120,20 @@ visitor DIDs to per-DID ACL grants over time.
 Same posture as a2a-acl: the strictest setting that doesn't break the
 common case is on by default.
 
+- **SSRF defence on** — `receiver.url` returned by your `resolveReceiver`
+  callback is validated before any `fetch()`: protocol must be `https:`
+  by default, hostname must NOT be a literal private/loopback/link-local/
+  metadata IP. Optional `allowedReceiverHosts` allowlist tightens this
+  to specific hostnames or `*.example.com` wildcards. See **Deployment
+  requirements** below.
+- **Body size cap on** — default `maxBodyBytes: 65536` (64 KiB).
+  Oversized requests get a 413 before any signing or forwarding.
 - **Envelope lifetime: 5 minutes**, hard-capped. A signer with a
   longer `exp` gets rejected by the verifier; a caller passing
   `lifetimeSec > 300` to `signEnvelope` throws at signing time.
+- **Hop count cap** — `claims.hop` validated as integer in `[0, 10]`;
+  defends in depth against a caller bypassing the receiver's
+  `depthGuard` with `Infinity` or `NaN`.
 - **Cross-peer replay defence** — every envelope has `sub = receiver.did`,
   so an envelope signed for receiver A can't be replayed against
   receiver B (the receiver-side `expectedSub` rejects it).
@@ -133,9 +144,66 @@ common case is on by default.
   flow into audit.
 - **Sanitiser on by default** — strips known prompt-injection markers
   before the envelope is built (so the signed payload is the
-  cleaned version).
+  cleaned version). Note: this **mutates `req.body`** in place; downstream
+  middleware sees the sanitised payload.
+- **No slug enumeration via status code** — unknown slugs and
+  malformed-receiver-callback both return `404 receiver_not_found`.
+  Operator-side bugs are logged via `logger.error` so they're visible
+  to you without leaking the existence of valid slugs to attackers.
+- **Upstream status clamped** — non-standard HTTP codes from a
+  broken receiver collapse to 502 rather than throwing in `res.status()`.
 - **No request/response body in audit** — only metadata. Sensitive
   payload contents stay out of the audit table by default.
+
+## Deployment requirements
+
+A few things the library cannot enforce on its own — you have to wire
+them at the deployment layer for the per-IP rate limit and SSRF
+defence to work as intended:
+
+### Reverse proxy + correct `trust proxy`
+
+The middleware reads `req.ip` for the rate-limit key. With Express
+`trust proxy: true` (or no proxy in front), an attacker can spoof
+`X-Forwarded-For` on every request and bypass per-IP limits entirely.
+
+**Required:**
+1. Deploy behind a reverse proxy you control (nginx, Cloudflare, ALB).
+2. The proxy MUST strip / overwrite incoming `X-Forwarded-For` headers.
+3. Set Express `trust proxy` to that proxy's exact CIDR — e.g.
+   `app.set('trust proxy', 'loopback')` for a same-host nginx, or
+   `app.set('trust proxy', ['10.0.0.0/8'])` for an in-cluster ingress.
+4. **Never** `app.set('trust proxy', true)` in production.
+
+### Multi-replica deployments
+
+The default `IpRateLimiter` uses a per-process `Map`. Across N replicas
+behind a load balancer, attackers get N× the allowed request volume.
+For HA deployments:
+- Put a CDN / reverse-proxy rate limit in front as the primary defence.
+- Or supply your own `rateLimiter` config implementing the same
+  `consume(key)` shape, backed by Redis or similar.
+- `a2a-caller` itself is single-process; a Redis-backed limiter is
+  v0.2 territory.
+
+### SSRF allowlist
+
+The default validation blocks literal private/loopback IPs and
+non-https protocols. For production, also pass an
+`allowedReceiverHosts` allowlist scoped to your actual receiver
+domains:
+
+```js
+publicChatMiddleware({
+  // ...
+  allowedReceiverHosts: ['*.ownify.ai', 'agent.example.com'],
+});
+```
+
+DNS-rebinding attacks (a hostname that resolves to a public IP at
+check-time, private IP at fetch-time) are NOT defended at this layer —
+mitigate with a forward proxy that re-validates per connection, or by
+resolving DNS once and passing a literal IP to fetch.
 
 ## What's req.firewall (and what isn't)
 

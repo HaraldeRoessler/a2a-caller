@@ -3,34 +3,56 @@
 //
 // Pipeline per request:
 //   1. Resolve receiver (caller-supplied callback): slug → { did, url }
-//      Fail with 404 if the receiver is unknown.
-//   2. Per-IP rate-limit (per-(ip, slug)). 429 on overflow.
-//   3. Optional sanitisation of req.body (a2a-acl exports sanitiseDeep).
-//   4. Capture caller-id (X-Caller-DID + visitor hash) for audit.
-//   5. Sign an AAE envelope on the portal's behalf (this library's DID).
-//   6. POST to receiver.url with the envelope in X-AAE.
-//   7. Stream the receiver's response back to the visitor.
-//   8. Fire audit row to caller-supplied sink.
+//      Fail with 404 if the receiver is unknown OR if the receiver
+//      shape / DID / URL is malformed (collapsed to 404 deliberately
+//      to prevent slug-existence enumeration via status code).
+//   2. Validate receiver.url — block non-http(s), private/loopback IPs,
+//      and (if configured) any host outside the allowlist (SSRF defence).
+//   3. Per-IP rate-limit (per-(ip, slug)). 429 on overflow.
+//   4. Body size guard. 413 if oversized.
+//   5. Optional sanitisation of req.body (a2a-acl exports sanitiseDeep).
+//   6. Capture caller-id (X-Caller-DID + visitor hash) for audit.
+//   7. Sign an AAE envelope on the portal's behalf (this library's DID).
+//   8. POST to receiver.url with the envelope in X-AAE.
+//   9. Stream the receiver's response back to the visitor.
+//  10. Fire audit row to caller-supplied sink.
 //
-// Things this middleware deliberately does NOT do:
-//   - Authentication of the visitor. The whole point is unauth.
-//   - Bearer-token swap-over-mid-flight. If you want auth, use a
-//     separate route with auth middleware in front of this one.
-//   - Long-running streaming. Each request is one POST → one response.
-//   - Caching. The receiver decides what's cacheable; we just forward.
+// IP-source caveat: req.ip resolves from X-Forwarded-For when Express
+// trust proxy is enabled. This middleware reads req.ip directly. You
+// MUST deploy behind a reverse proxy you control AND set Express
+// trust proxy to that proxy's exact CIDR — never `true` blindly. See
+// README.md "Deployment requirements".
 
 import { sanitiseDeep } from 'a2a-acl';
 import { signEnvelope } from './envelope.js';
 import { IpRateLimiter } from './ip-rate-limit.js';
 import { captureCallerId } from './caller-id.js';
 import { buildAuditRow, emitAudit } from './audit.js';
+import { validateReceiverUrl } from './url-validation.js';
 
 const DEFAULT_AUD = 'a2a-ingress';
 const DEFAULT_HEADER_NAME = 'X-AAE';
 const DEFAULT_FORWARD_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_BODY_BYTES = 64 * 1024;          // 64 KiB hard cap
+const DEFAULT_ALLOWED_PROTOCOLS = ['https:'];
+
+// Same shape the receiver-side a2a-acl validates — keep them locally
+// so we don't depend on caller-id.js's regex (which is for header
+// validation, conceptually distinct from receiver-DID validation
+// even if the regex is the same).
+const RECEIVER_DID_PATTERN = /^did:[a-z0-9]{1,32}:[A-Za-z0-9._-]{1,256}$/;
 
 function defaultSlugFromParams(req) {
   return req.params?.slug ?? null;
+}
+
+function clampHttpStatus(n) {
+  // Defends against res.status() throwing on non-standard upstream codes.
+  // Express only accepts 100-999. fetch() can in principle hand back
+  // anything if the upstream is broken; we treat anything outside
+  // 100-599 as "upstream produced garbage" → 502.
+  if (Number.isInteger(n) && n >= 100 && n <= 599) return n;
+  return 502;
 }
 
 /**
@@ -44,17 +66,26 @@ function defaultSlugFromParams(req) {
  *      Result of loadSigningKey(seed). The private key never leaves
  *      the process — we only ever sign with it.
  *   @param {string} cfg.callerSigKeyId
- *      The key_id the receiver will resolve to your public key. Convention:
- *      whatever your receiver's KeyResolver uses to look up your pubkey.
+ *      The key_id the receiver will resolve to your public key.
  *
- *   @param {object} [cfg.rateLimiter]   — IpRateLimiter instance (or compatible). Constructed lazily if absent.
+ *   @param {string[]} [cfg.allowedReceiverHosts]
+ *      SSRF defence — if set, receiver.url's hostname must match at
+ *      least one entry (exact or '*.example.com' wildcard). Strongly
+ *      recommended for production.
+ *   @param {string[]} [cfg.allowedProtocols=['https:']]
+ *      Permitted URL protocols. Add 'http:' only for local dev.
+ *   @param {boolean} [cfg.allowPrivateHosts=false]
+ *      Skip the private-IP / loopback check. Set true only for tests.
+ *
+ *   @param {object} [cfg.rateLimiter]   — IpRateLimiter instance. Constructed lazily if absent.
  *   @param {number} [cfg.requestsPerMinute=30] — used only if no rateLimiter passed
  *
  *   @param {(req: object) => string|null} [cfg.getSlug] — defaults to req.params.slug
  *   @param {string} [cfg.aud='a2a-ingress'] — must match the receiver's expectedAud
  *   @param {string} [cfg.envelopeHeader='X-AAE'] — header name to send the envelope in
- *   @param {boolean} [cfg.sanitise=true] — strip prompt-injection markers from req.body before forward
- *   @param {number} [cfg.forwardTimeoutMs=30000] — fetch timeout to receiver
+ *   @param {boolean} [cfg.sanitise=true] — strip prompt-injection markers before forward (mutates req.body)
+ *   @param {number} [cfg.maxBodyBytes=65536] — hard ceiling on serialized request body size; 413 if exceeded
+ *   @param {number} [cfg.forwardTimeoutMs=30000] — covers BOTH the request and body-read phases of the upstream call
  *
  *   @param {object} [cfg.callerIdOpts] — passed to captureCallerId()
  *
@@ -76,8 +107,18 @@ export function publicChatMiddleware(cfg) {
   const envelopeHeader = cfg.envelopeHeader ?? DEFAULT_HEADER_NAME;
   const sanitiseEnabled = cfg.sanitise !== false;
   const forwardTimeoutMs = cfg.forwardTimeoutMs ?? DEFAULT_FORWARD_TIMEOUT_MS;
+  const maxBodyBytes = cfg.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES;
   const callerIdOpts = cfg.callerIdOpts ?? {};
   const logger = cfg.logger ?? null;
+  const urlValidationOpts = {
+    allowedReceiverHosts: cfg.allowedReceiverHosts,
+    allowedProtocols: cfg.allowedProtocols ?? DEFAULT_ALLOWED_PROTOCOLS,
+    allowPrivateHosts: cfg.allowPrivateHosts === true,
+  };
+
+  if (!Number.isInteger(maxBodyBytes) || maxBodyBytes <= 0) {
+    throw new Error('cfg.maxBodyBytes must be a positive integer');
+  }
 
   return async function publicChat(req, res) {
     const slug = getSlug(req);
@@ -96,12 +137,29 @@ export function publicChatMiddleware(cfg) {
     if (!receiver) {
       return res.status(404).json({ error: 'receiver_not_found' });
     }
-    if (typeof receiver.did !== 'string' || typeof receiver.url !== 'string') {
-      logger?.error?.({ slug }, 'resolveReceiver returned malformed receiver');
-      return res.status(500).json({ error: 'receiver_misconfigured' });
+    if (typeof receiver.did !== 'string' || typeof receiver.url !== 'string'
+        || !RECEIVER_DID_PATTERN.test(receiver.did)) {
+      // Operator-side bug — log loudly server-side, but return 404 to
+      // the client so an attacker can't enumerate "exists but broken"
+      // versus "doesn't exist". Same status as the unknown-slug case.
+      logger?.error?.({ slug, didShape: typeof receiver.did }, 'resolveReceiver returned malformed receiver — fix your callback');
+      return res.status(404).json({ error: 'receiver_not_found' });
     }
 
-    // 2. Per-IP rate limit
+    // 2. SSRF defence — validate receiver.url before any network call
+    const urlCheck = validateReceiverUrl(receiver.url, urlValidationOpts);
+    if (!urlCheck.ok) {
+      // Same 404 collapse as above for the same reason.
+      logger?.error?.({ slug, reason: urlCheck.reason }, 'resolveReceiver returned blocked URL — fix your callback');
+      return res.status(404).json({ error: 'receiver_not_found' });
+    }
+    const validatedUrl = urlCheck.url.toString();
+
+    // 3. Per-IP rate limit
+    // IMPORTANT: req.ip is X-Forwarded-For-derived when Express trust
+    // proxy is enabled. Deploy behind a reverse proxy you control and
+    // set trust proxy to that proxy's exact CIDR — never `true`
+    // blindly. See README.md.
     const ip = req.ip ?? req.connection?.remoteAddress ?? 'unknown';
     const rlKey = IpRateLimiter.keyOf(ip, slug);
     if (!rateLimiter.consume(rlKey)) {
@@ -120,23 +178,38 @@ export function publicChatMiddleware(cfg) {
       return res.status(429).json({ error: 'rate_limit_exceeded' });
     }
 
-    // 3. Sanitise (if enabled). Body must be JSON-parsed already
-    //    (mount express.json() before this middleware).
+    // 4. Body size guard. We rely on upstream express.json() having
+    //    already parsed and rejected oversized payloads, but defend in
+    //    depth — a forgotten { limit } leaves Express 4 unbounded.
+    let serializedBody;
+    try {
+      serializedBody = JSON.stringify(req.body ?? {});
+    } catch (err) {
+      logger?.warn?.({ slug, err: err?.message }, 'request body not serializable');
+      return res.status(400).json({ error: 'body_not_serializable' });
+    }
+    if (Buffer.byteLength(serializedBody, 'utf8') > maxBodyBytes) {
+      return res.status(413).json({ error: 'payload_too_large', max_bytes: maxBodyBytes });
+    }
+
+    // 5. Sanitise (if enabled). Mutates req.body in place.
     if (sanitiseEnabled && req.body && typeof req.body === 'object') {
       const { value, hits } = sanitiseDeep(req.body);
       req.body = value;
       if (hits > 0) {
         logger?.warn?.({ slug, hits }, 'public-chat payload sanitised');
+        // Re-serialize after mutation so the bytes we forward match
+        // the (smaller) sanitised payload.
+        serializedBody = JSON.stringify(req.body ?? {});
       }
     }
 
-    // 4. Capture caller-id for audit
+    // 6. Capture caller-id for audit
     const callerId = captureCallerId(req, callerIdOpts);
 
-    // 5. Sign envelope on portal's behalf. We pass receiver.did as `sub`
-    //    so the receiver-side `expectedSub` validation (cross-peer
-    //    replay defence) accepts it: an envelope built for receiver A
-    //    cannot be replayed against receiver B.
+    // 7. Sign envelope on portal's behalf. We pass receiver.did as `sub`
+    //    so the receiver-side `expectedSub` validation rejects an
+    //    envelope built for receiver A replayed against receiver B.
     let envelope;
     try {
       envelope = signEnvelope({
@@ -150,30 +223,29 @@ export function publicChatMiddleware(cfg) {
       return res.status(500).json({ error: 'envelope_signing_failed' });
     }
 
-    // 6. Forward to receiver
+    // 8. Forward to receiver. The single AbortController spans BOTH
+    //    the request and body-read phases — clearing the timer too
+    //    early would let a slow upstream stall the body read
+    //    indefinitely.
     let upstream;
     let upstreamBody;
     let upstreamStatus = null;
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), forwardTimeoutMs);
     try {
-      const ac = new AbortController();
-      const timer = setTimeout(() => ac.abort(), forwardTimeoutMs);
-      try {
-        upstream = await fetch(receiver.url, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            [envelopeHeader]: envelope,
-          },
-          body: JSON.stringify(req.body ?? {}),
-          signal: ac.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
+      upstream = await fetch(validatedUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          [envelopeHeader]: envelope,
+        },
+        body: serializedBody,
+        signal: ac.signal,
+      });
       upstreamStatus = upstream.status;
       upstreamBody = await upstream.text();
     } catch (err) {
-      logger?.error?.({ err: err?.message, slug, url: receiver.url }, 'forward to receiver failed');
+      logger?.error?.({ err: err?.message, slug, url: validatedUrl }, 'forward to receiver failed');
       emitAudit({
         sink: cfg.sink, logger,
         row: buildAuditRow({
@@ -187,17 +259,21 @@ export function publicChatMiddleware(cfg) {
         }),
       });
       return res.status(502).json({ error: 'receiver_unreachable' });
+    } finally {
+      clearTimeout(timer);
     }
 
-    // 7. Stream response back. Don't echo upstream-set CORS or
-    //    Set-Cookie — those belong to the receiver-portal trust
-    //    boundary, not the visitor's browser.
-    res.status(upstream.status);
+    // 9. Stream response back. Don't echo upstream-set CORS or
+    //    Set-Cookie — those belong to the receiver/portal trust
+    //    boundary, not the visitor's browser. Clamp the upstream
+    //    status to a valid HTTP range; non-standard codes from a
+    //    broken upstream become 502 rather than crashing res.status().
+    res.status(clampHttpStatus(upstreamStatus));
     const ct = upstream.headers.get('content-type');
     if (ct) res.setHeader('content-type', ct);
     res.send(upstreamBody);
 
-    // 8. Audit
+    // 10. Audit
     emitAudit({
       sink: cfg.sink, logger,
       row: buildAuditRow({
@@ -215,11 +291,14 @@ export function publicChatMiddleware(cfg) {
 
 // Pull jti from a base64url-encoded envelope without re-importing the
 // verifier. Best-effort — used for audit only, returns null on any
-// parse error rather than throwing.
+// parse error rather than throwing. replaceAll instead of regex so the
+// pattern doesn't get copy-pasted into a code path that processes
+// attacker input (CodeQL js/polynomial-redos hygiene — same fix as
+// b64url in envelope.js).
 function extractJtiFromEnvelope(envelopeStr) {
   try {
     const json = Buffer.from(
-      envelopeStr.replace(/-/g, '+').replace(/_/g, '/'),
+      envelopeStr.replaceAll('-', '+').replaceAll('_', '/'),
       'base64',
     ).toString('utf8');
     const parsed = JSON.parse(json);

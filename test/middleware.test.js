@@ -83,6 +83,8 @@ test('end-to-end: visitor POST → portal signs → receiver verifies', async ()
     signingKey: { key: loadSigningKey(seed) },
     callerSigKeyId: 'caller-v1',
     requestsPerMinute: 100,
+    allowPrivateHosts: true,
+    allowedProtocols: ['http:'],
   }));
 
   const r = await fetch(`${app.baseUrl}/v1/chat/acme`, {
@@ -108,6 +110,8 @@ test('unknown slug → 404 receiver_not_found', async () => {
     signingKey: { key: loadSigningKey(seed) },
     callerSigKeyId: 'k',
     requestsPerMinute: 100,
+    allowPrivateHosts: true,
+    allowedProtocols: ['http:'],
   }));
   const r = await fetch(`${app.baseUrl}/v1/chat/unknown`, {
     method: 'POST',
@@ -127,6 +131,8 @@ test('rate-limit overflow → 429', async () => {
     signingKey: { key: loadSigningKey(seed) },
     callerSigKeyId: 'caller-v1',
     rateLimiter: new IpRateLimiter({ requestsPerMinute: 1 }),
+    allowPrivateHosts: true,
+    allowedProtocols: ['http:'],
   }));
 
   const a = await fetch(`${app.baseUrl}/v1/chat/x`, {
@@ -151,6 +157,8 @@ test('audit sink fires once per request and includes claimed_did', async () => {
     signingKey: { key: loadSigningKey(seed) },
     callerSigKeyId: 'caller-v1',
     requestsPerMinute: 100,
+    allowPrivateHosts: true,
+    allowedProtocols: ['http:'],
     sink: (row) => rows.push(row),
   }));
   await fetch(`${app.baseUrl}/v1/chat/x`, {
@@ -201,10 +209,78 @@ test('config validation: missing callerDid → throw at construct', () => {
   );
 });
 
-test('receiver returning malformed shape → 500 receiver_misconfigured', async () => {
+test('receiver returning malformed shape → 404 receiver_not_found (no enumeration)', async () => {
+  // Operator-side bug surfaces server-side via the logger, but the
+  // client gets the same status as an unknown slug to prevent
+  // enumeration of "slug exists but broken" vs "slug doesn't exist".
   const { seed } = freshKeypair();
   const app = await startApp(publicChatMiddleware({
     resolveReceiver: async () => ({ did: 123, url: 456 }),
+    callerDid: 'did:moltrust:p',
+    signingKey: { key: loadSigningKey(seed) },
+    callerSigKeyId: 'k',
+    requestsPerMinute: 100,
+    allowPrivateHosts: true,
+    allowedProtocols: ['http:'],
+  }));
+  const r = await fetch(`${app.baseUrl}/v1/chat/x`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(r.status, 404);
+  const json = await r.json();
+  assert.equal(json.error, 'receiver_not_found');
+  await app.close();
+});
+
+test('SSRF defence: literal private IP rejected with 404', async () => {
+  // Production default — no allowPrivateHosts. Receiver returns a
+  // private-IP URL; library blocks it before any fetch fires.
+  const { seed } = freshKeypair();
+  const app = await startApp(publicChatMiddleware({
+    resolveReceiver: async () => ({
+      did: 'did:moltrust:t',
+      url: 'http://10.0.0.1/api/a2a/message',
+    }),
+    callerDid: 'did:moltrust:p',
+    signingKey: { key: loadSigningKey(seed) },
+    callerSigKeyId: 'k',
+    requestsPerMinute: 100,
+    allowedProtocols: ['http:', 'https:'],   // protocol allowed; private-host check is what blocks
+  }));
+  const r = await fetch(`${app.baseUrl}/v1/chat/x`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(r.status, 404, 'private IP must be blocked at SSRF layer');
+  await app.close();
+});
+
+test('SSRF defence: cloud metadata IP rejected', async () => {
+  const { seed } = freshKeypair();
+  const app = await startApp(publicChatMiddleware({
+    resolveReceiver: async () => ({
+      did: 'did:moltrust:t',
+      url: 'http://169.254.169.254/latest/meta-data/',
+    }),
+    callerDid: 'did:moltrust:p',
+    signingKey: { key: loadSigningKey(seed) },
+    callerSigKeyId: 'k',
+    requestsPerMinute: 100,
+    allowedProtocols: ['http:', 'https:'],
+  }));
+  const r = await fetch(`${app.baseUrl}/v1/chat/x`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(r.status, 404);
+  await app.close();
+});
+
+test('SSRF defence: non-http(s) protocol rejected', async () => {
+  const { seed } = freshKeypair();
+  const app = await startApp(publicChatMiddleware({
+    resolveReceiver: async () => ({
+      did: 'did:moltrust:t',
+      url: 'file:///etc/passwd',
+    }),
     callerDid: 'did:moltrust:p',
     signingKey: { key: loadSigningKey(seed) },
     callerSigKeyId: 'k',
@@ -213,6 +289,93 @@ test('receiver returning malformed shape → 500 receiver_misconfigured', async 
   const r = await fetch(`${app.baseUrl}/v1/chat/x`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
   });
-  assert.equal(r.status, 500);
+  assert.equal(r.status, 404);
   await app.close();
+});
+
+test('SSRF defence: allowedReceiverHosts allowlist rejects non-listed hosts', async () => {
+  const { seed } = freshKeypair();
+  const app = await startApp(publicChatMiddleware({
+    resolveReceiver: async () => ({
+      did: 'did:moltrust:t',
+      url: 'https://evil.example.com/api/a2a/message',
+    }),
+    callerDid: 'did:moltrust:p',
+    signingKey: { key: loadSigningKey(seed) },
+    callerSigKeyId: 'k',
+    requestsPerMinute: 100,
+    allowedReceiverHosts: ['*.ownify.ai', 'ownify.ai'],
+  }));
+  const r = await fetch(`${app.baseUrl}/v1/chat/x`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(r.status, 404, 'host outside allowlist must be blocked');
+  await app.close();
+});
+
+test('receiver.did with bad shape → 404 (no signing happens)', async () => {
+  const { seed } = freshKeypair();
+  const app = await startApp(publicChatMiddleware({
+    resolveReceiver: async () => ({
+      did: 'not-a-valid-did',
+      url: 'http://127.0.0.1:9/api/a2a/message',
+    }),
+    callerDid: 'did:moltrust:p',
+    signingKey: { key: loadSigningKey(seed) },
+    callerSigKeyId: 'k',
+    requestsPerMinute: 100,
+    allowPrivateHosts: true,
+    allowedProtocols: ['http:'],
+  }));
+  const r = await fetch(`${app.baseUrl}/v1/chat/x`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(r.status, 404);
+  await app.close();
+});
+
+test('body size guard: oversized body → 413', async () => {
+  const { seed, pubB64url } = freshKeypair();
+  const recv = await startMockReceiver(pubB64url, () => 'did:moltrust:t');
+  const app = await startApp(publicChatMiddleware({
+    resolveReceiver: async () => ({ did: 'did:moltrust:t', url: recv.url }),
+    callerDid: 'did:moltrust:p',
+    signingKey: { key: loadSigningKey(seed) },
+    callerSigKeyId: 'caller-v1',
+    requestsPerMinute: 100,
+    allowPrivateHosts: true,
+    allowedProtocols: ['http:'],
+    maxBodyBytes: 100,   // tight cap for the test
+  }));
+  const huge = { msg: 'x'.repeat(500) };
+  const r = await fetch(`${app.baseUrl}/v1/chat/x`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(huge),
+  });
+  assert.equal(r.status, 413);
+  const json = await r.json();
+  assert.equal(json.error, 'payload_too_large');
+  await app.close();
+  await recv.close();
+});
+
+test('config validation: maxBodyBytes must be a positive integer', () => {
+  const { seed } = freshKeypair();
+  assert.throws(
+    () => publicChatMiddleware({
+      resolveReceiver: async () => null,
+      callerDid: 'did:x:1', signingKey: { key: loadSigningKey(seed) }, callerSigKeyId: 'k',
+      maxBodyBytes: 0,
+    }),
+    /maxBodyBytes/,
+  );
+  assert.throws(
+    () => publicChatMiddleware({
+      resolveReceiver: async () => null,
+      callerDid: 'did:x:1', signingKey: { key: loadSigningKey(seed) }, callerSigKeyId: 'k',
+      maxBodyBytes: -5,
+    }),
+    /maxBodyBytes/,
+  );
 });
