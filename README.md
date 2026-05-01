@@ -223,6 +223,29 @@ with the sanitised version. Any downstream Express middleware mounted
 on the same route will see the cleaned payload, not the raw one. Set
 `sanitise: false` if you need to preserve the original body.
 
+### Hot reload / multi-mount
+
+If you call `publicChatMiddleware()` more than once per process
+(hot reload during dev, multiple routes, dynamic per-tenant
+remount), the lazy default constructs a fresh `IpRateLimiter` —
+each with its own background sweep interval. The intervals are
+`unref`'d so they don't keep the process alive, but they DO keep
+ticking. Construct one `rateLimiter` instance, pass it explicitly
+to every middleware call, and `rateLimiter.stop()` on shutdown:
+
+```js
+import { IpRateLimiter, publicChatMiddleware } from 'a2a-caller';
+
+const sharedRateLimiter = new IpRateLimiter({ requestsPerMinute: 30 });
+
+app.post('/v1/chat/:slug', publicChatMiddleware({
+  rateLimiter: sharedRateLimiter,
+  /* ... */
+}));
+
+process.on('SIGTERM', () => { sharedRateLimiter.stop(); /* drain... */ });
+```
+
 ### Multi-replica rate-limiter
 
 The default `IpRateLimiter` is per-process. For HA deployments swap

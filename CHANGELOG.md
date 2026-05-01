@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.1.4 — 2026-05-01
+
+Fifth review round (two reviewers, 7 + 1 unique findings — the surface
+is now small enough that R2 found exactly one item, all in
+"defence-in-depth" territory). All in-scope items addressed.
+
+### Fixed
+
+- **Audit gaps on 413 / 504 / 503 paths (MED)** — the rate-limit-
+  exceeded 429 path was already audited; the body-cap 413 and the
+  resolveReceiver-timeout 504 / resolveReceiver-throw 503 paths now
+  emit audit rows too. An attacker can no longer slip past audit by
+  triggering oversized payloads or slow lookups.
+- **Unbounded slug length (MED)** — `slug.length > 256` now hits the
+  same 400 missing_slug response as missing slug. Prevents multi-MB
+  slugs from flowing into resolveReceiver / rate-limit keys / audit
+  logs.
+- **Unhandled rejection from raced resolveReceiver promise (LOW)** —
+  the resolveReceiver promise now has a no-op `.catch` attached
+  before the race so a post-timeout rejection (DB query that
+  eventually fails 30s after we returned 504) doesn't surface as
+  `unhandledRejection`. Silent at runtime, no behavioural change for
+  successful resolutions.
+- **Arrays passed to sanitiseDeep (LOW)** — sanitiser branch now
+  excludes arrays explicitly. Arrays are forwarded unchanged rather
+  than handed to a function that's keyed on object property names.
+- **`res.send` without `headersSent` guard (LOW)** — every response
+  path now goes through a `safeSend` helper that checks
+  `res.headersSent` first. A misbehaving upstream-mounted middleware
+  that sent headers before this handler ran can no longer crash the
+  request handler with "headers already sent."
+- **`forwardTimeoutMs` not validated (INFO)** — now construct-time
+  checked against `Number.isFinite(x) && x > 0` like the other
+  timeout configs. NaN / Infinity / negative throw loudly.
+- **Sweep-interval accumulation (LOW, doc-only)** — clarified in
+  README that operators wiring `publicChatMiddleware` more than once
+  per process (hot reload, multi-route mount) should pass a shared
+  `rateLimiter` instance and `.stop()` it on shutdown rather than
+  let the lazy-construct create a new interval per call.
+
+### Tests
+
+- 107 → 114 tests passing. New coverage:
+  - Oversized slug → 400.
+  - resolveReceiver throw → 503 with audit row asserted.
+  - resolveReceiver timeout → 504 with audit row asserted.
+  - 413 payload-too-large with audit row asserted.
+  - Array request body forwarded without crash.
+  - `forwardTimeoutMs` invalid-value rejection (4 sub-cases:
+    0, -5, NaN, Infinity).
+  - Post-timeout resolveReceiver rejection does NOT trigger
+    `unhandledRejection` (uses a process-level listener to verify).
+
+### Compatibility
+
+Behavioural changes (all minor):
+- 413 / 503 / 504 now emit audit rows. If your sink processes
+  them by tenant / period and was assuming "only 200 / 429 / 502
+  fire," update accordingly.
+- Slug length 257+ now returns 400 instead of being passed through.
+  No legitimate caller should be near this limit.
+
 ## 0.1.3 — 2026-05-01
 
 Fourth review round (two reviewers, 9 unique findings — most edge-case;

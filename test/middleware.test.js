@@ -612,3 +612,162 @@ test('config validation: resolveReceiverTimeoutMs must be a positive number', ()
     /resolveReceiverTimeoutMs/,
   );
 });
+
+test('config validation: forwardTimeoutMs must be a positive number', () => {
+  const { seed } = freshKeypair();
+  for (const bad of [0, -5, NaN, Infinity]) {
+    assert.throws(
+      () => publicChatMiddleware({
+        resolveReceiver: async () => null,
+        callerDid: 'did:x:1', signingKey: { key: loadSigningKey(seed) }, callerSigKeyId: 'k',
+        forwardTimeoutMs: bad,
+      }),
+      /forwardTimeoutMs/,
+      `must reject forwardTimeoutMs=${bad}`,
+    );
+  }
+});
+
+test('oversized slug → 400 missing_slug', async () => {
+  const { seed } = freshKeypair();
+  const app = await startApp(publicChatMiddleware({
+    resolveReceiver: async () => null,
+    callerDid: 'did:moltrust:p',
+    signingKey: { key: loadSigningKey(seed) },
+    callerSigKeyId: 'k',
+    requestsPerMinute: 100,
+  }));
+  const longSlug = 'a'.repeat(500);
+  const r = await fetch(`${app.baseUrl}/v1/chat/${longSlug}`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(r.status, 400);
+  await app.close();
+});
+
+test('resolveReceiver throws → 503 with audit row', async () => {
+  const { seed } = freshKeypair();
+  const rows = [];
+  const app = await startApp(publicChatMiddleware({
+    resolveReceiver: async () => { throw new Error('db unreachable'); },
+    callerDid: 'did:moltrust:portal',
+    signingKey: { key: loadSigningKey(seed) },
+    callerSigKeyId: 'k',
+    requestsPerMinute: 100,
+    sink: (row) => rows.push(row),
+  }));
+  const r = await fetch(`${app.baseUrl}/v1/chat/x`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(r.status, 503);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(rows.length, 1, 'audit row required on resolveReceiver throw');
+  assert.equal(rows[0].caller_did, 'did:moltrust:portal');
+  assert.equal(rows[0].receiver_slug, 'x');
+  await app.close();
+});
+
+test('resolveReceiver timeout → 504 with audit row', async () => {
+  const { seed } = freshKeypair();
+  const rows = [];
+  const app = await startApp(publicChatMiddleware({
+    resolveReceiver: async () => new Promise(() => {}),
+    callerDid: 'did:moltrust:portal',
+    signingKey: { key: loadSigningKey(seed) },
+    callerSigKeyId: 'k',
+    requestsPerMinute: 100,
+    resolveReceiverTimeoutMs: 50,
+    sink: (row) => rows.push(row),
+  }));
+  const r = await fetch(`${app.baseUrl}/v1/chat/x`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(r.status, 504);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(rows.length, 1, 'audit row required on resolveReceiver timeout');
+  await app.close();
+});
+
+test('payload too large → 413 with audit row', async () => {
+  const { seed } = freshKeypair();
+  const recv = await import('node:crypto').then(({ generateKeyPairSync }) => generateKeyPairSync('ed25519'));
+  // We just need a working middleware — receiver lookup succeeds, but
+  // body cap fires before we ever forward. Use a stub receiver URL.
+  const rows = [];
+  const app = await startApp(publicChatMiddleware({
+    resolveReceiver: async () => ({
+      did: 'did:moltrust:tenant',
+      url: 'https://agent.example.com/api/a2a/message',
+    }),
+    callerDid: 'did:moltrust:portal',
+    signingKey: { key: loadSigningKey(seed) },
+    callerSigKeyId: 'k',
+    requestsPerMinute: 100,
+    maxBodyBytes: 100,
+    sink: (row) => rows.push(row),
+  }));
+  const huge = { msg: 'x'.repeat(500) };
+  const r = await fetch(`${app.baseUrl}/v1/chat/x`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(huge),
+  });
+  assert.equal(r.status, 413);
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(rows.length, 1, 'audit row required on 413 payload-too-large');
+  await app.close();
+});
+
+test('array request body forwarded as-is (sanitiser skipped)', async () => {
+  // When req.body is an array, the sanitiser does NOT mutate it.
+  // We don't need to verify a2a-acl's sanitiseDeep behaviour, just
+  // that the middleware doesn't crash and forwards the array.
+  const { seed, pubB64url } = freshKeypair();
+  const recv = await startMockReceiver(pubB64url, () => 'did:moltrust:t');
+  const app = await startApp(publicChatMiddleware({
+    resolveReceiver: async () => ({ did: 'did:moltrust:t', url: recv.url }),
+    callerDid: 'did:moltrust:p',
+    signingKey: { key: loadSigningKey(seed) },
+    callerSigKeyId: 'caller-v1',
+    requestsPerMinute: 100,
+    allowPrivateHosts: true,
+    allowedProtocols: ['http:'],
+  }));
+  const r = await fetch(`${app.baseUrl}/v1/chat/x`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify([1, 2, 3]),
+  });
+  assert.equal(r.status, 200, 'array body must not crash the middleware');
+  await app.close();
+  await recv.close();
+});
+
+test('post-timeout resolveReceiver rejection does not surface as unhandledRejection', async () => {
+  const { seed } = freshKeypair();
+  let unhandled = null;
+  const onUnhandled = (reason) => { unhandled = reason; };
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    const app = await startApp(publicChatMiddleware({
+      // Resolves AFTER the timeout, with a rejection. If the middleware
+      // didn't attach a no-op .catch to the resolveP promise, this
+      // would surface as unhandledRejection.
+      resolveReceiver: () => new Promise((_, reject) => setTimeout(() => reject(new Error('post-timeout boom')), 200)),
+      callerDid: 'did:moltrust:p',
+      signingKey: { key: loadSigningKey(seed) },
+      callerSigKeyId: 'k',
+      requestsPerMinute: 100,
+      resolveReceiverTimeoutMs: 50,
+    }));
+    await fetch(`${app.baseUrl}/v1/chat/x`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+    });
+    // Wait long enough for the post-timeout rejection to fire.
+    await new Promise((r) => setTimeout(r, 350));
+    assert.equal(unhandled, null, 'post-timeout rejection must be silenced');
+    await app.close();
+  } finally {
+    process.removeListener('unhandledRejection', onUnhandled);
+  }
+});
