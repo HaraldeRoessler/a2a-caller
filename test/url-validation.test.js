@@ -28,6 +28,12 @@ test('isPrivateOrLoopbackHost: IPv6 loopback / link-local / ULA', () => {
   assert.equal(isPrivateOrLoopbackHost('fd00::1'), true);
 });
 
+test('isPrivateOrLoopbackHost: IPv6 fully-expanded loopback (defence-in-depth)', () => {
+  // Even if a future Node URL parser kept the expanded form, we catch it.
+  assert.equal(isPrivateOrLoopbackHost('0:0:0:0:0:0:0:1'), true);
+  assert.equal(isPrivateOrLoopbackHost('0:0:0:0:0:0:0:0'), true);
+});
+
 test('isPrivateOrLoopbackHost: IPv4-mapped IPv6 catches private v4', () => {
   assert.equal(isPrivateOrLoopbackHost('::ffff:10.0.0.1'), true);
   assert.equal(isPrivateOrLoopbackHost('::ffff:127.0.0.1'), true);
@@ -122,5 +128,62 @@ test('validateReceiverUrl: malformed URL string', () => {
 
 test('validateReceiverUrl: case-insensitive hostname matching against allowlist', () => {
   const r = validateReceiverUrl('https://Agent.Example.COM/', { allowedReceiverHosts: ['agent.example.com'] });
+  assert.equal(r.ok, true);
+});
+
+test('validateReceiverUrl: rejects URL with embedded credentials', () => {
+  const r = validateReceiverUrl('https://user:pass@agent.example.com/api');
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'url_embedded_credentials');
+});
+
+test('validateReceiverUrl: rejects URL with embedded username only', () => {
+  const r = validateReceiverUrl('https://user@agent.example.com/api');
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'url_embedded_credentials');
+});
+
+test('validateReceiverUrl: well-known internal port (Redis) blocked by default denylist', () => {
+  const r = validateReceiverUrl('https://agent.example.com:6379/');
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'url_port_denied');
+});
+
+test('validateReceiverUrl: PostgreSQL port blocked', () => {
+  const r = validateReceiverUrl('https://agent.example.com:5432/');
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'url_port_denied');
+});
+
+test('validateReceiverUrl: kubelet port blocked', () => {
+  const r = validateReceiverUrl('https://agent.example.com:10250/');
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'url_port_denied');
+});
+
+test('validateReceiverUrl: standard https port (no port in URL) passes', () => {
+  const r = validateReceiverUrl('https://agent.example.com/api');
+  assert.equal(r.ok, true);
+});
+
+test('validateReceiverUrl: explicit standard https port passes', () => {
+  const r = validateReceiverUrl('https://agent.example.com:443/api');
+  assert.equal(r.ok, true);
+});
+
+test('validateReceiverUrl: allowedReceiverPorts allowlist OVERRIDES denylist', () => {
+  // 6379 is in denylist; if operator explicitly allows it, OK.
+  const r = validateReceiverUrl('https://agent.example.com:6379/', { allowedReceiverPorts: [6379] });
+  assert.equal(r.ok, true);
+});
+
+test('validateReceiverUrl: allowedReceiverPorts allowlist rejects non-listed port', () => {
+  const r = validateReceiverUrl('https://agent.example.com:8443/', { allowedReceiverPorts: [443] });
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, 'url_port_not_allowed');
+});
+
+test('validateReceiverUrl: empty deniedReceiverPorts disables port check', () => {
+  const r = validateReceiverUrl('https://agent.example.com:6379/', { deniedReceiverPorts: new Set() });
   assert.equal(r.ok, true);
 });

@@ -1,5 +1,86 @@
 # Changelog
 
+## 0.1.2 — 2026-05-01
+
+Third external review round (overlapping reviewers; 10 + 4 raw findings,
+one was a misread of 0.1.1). All in-scope items addressed.
+
+### Fixed
+
+- **SSRF via HTTP redirects (HIGH)** — `fetch()` now runs with
+  `redirect: 'error'`. A receiver responding 3xx to an attacker
+  -controlled Location used to bypass `validateReceiverUrl` (which
+  only inspected the initial URL); now any redirect surfaces as
+  `502 receiver_unreachable`. Receivers must return their final
+  URL from `resolveReceiver`.
+- **Embedded credentials in receiver URL (MED)** — URLs with
+  `username` or `password` (e.g. `https://user:pw@host/...`) are
+  rejected with `url_embedded_credentials` before any `fetch()`.
+  Without this, `fetch()` synthesised an Authorization header from
+  the embedded credentials and leaked them to the receiver.
+- **Arbitrary internal-service ports on allowlisted hosts (MED)** —
+  default port denylist for well-known internal services (SSH, SMTP,
+  Redis, PostgreSQL, MongoDB, RabbitMQ, kubelet, Docker daemon,
+  Memcached, Elasticsearch, etc.; full list as `DEFAULT_DENIED_PORTS`).
+  Optional `allowedReceiverPorts` config for strict allowlist mode
+  that overrides the denylist. Optional `deniedReceiverPorts` to
+  override the default set.
+- **IPv6 fully-expanded loopback (LOW)** — `isPrivateOrLoopbackHost`
+  now explicitly matches `0:0:0:0:0:0:0:1` and `0:0:0:0:0:0:0:0` in
+  addition to the compressed `::1` / `::` forms. Defends against
+  future Node URL-parser changes that might keep the expanded form.
+- **`X-Content-Type-Options: nosniff` (LOW)** — hard-coded on every
+  visitor response. A compromised receiver returning misleading
+  Content-Type can no longer be MIME-sniffed and executed by the
+  visitor's browser.
+- **`loadSigningKey` regex consistency (LOW)** — switched from
+  `.replace(/-/g, '+')` to `.replaceAll('-', '+')` to match the
+  rest of the library. Same code-hygiene rationale as the b64url
+  encoder fix in 0.1.0+1; pre-empts a copy-paste regex from
+  reaching an attacker-input path in a future refactor.
+
+### Added — documentation
+
+- README "Deployment requirements" section now documents:
+  - The full SSRF default-deny list (protocols, private IPs,
+    embedded credentials, internal-service ports, redirects).
+  - `allowedReceiverPorts` for tight port allowlisting.
+  - Allowlist wildcard semantics: `*.example.com` matches sub-hosts
+    at ANY depth, not just one level (consistent with browser cookie
+    scoping).
+  - "Request body mutation" subsection explaining `sanitise: true`
+    replaces `req.body` in place.
+  - "Multi-replica rate-limiter" subsection with a complete
+    Redis-backed `consume(key)` example so operators can drop in
+    a multi-pod-safe limiter.
+- SECURITY.md "Defended" section expanded with the redirect-error,
+  embedded-credentials, and nosniff fixes.
+
+### Tests
+
+- 75 → 89 tests passing. New coverage:
+  - `url-validation.test.js`: IPv6 expanded loopback (1), embedded
+    credentials reject (2), port denylist (3 well-known services),
+    standard port pass (2), `allowedReceiverPorts` allowlist (3).
+  - `middleware.test.js`: receiver redirect → 502 (1), nosniff
+    response header (1), embedded-credentials rejection (1).
+
+### Reviewer note
+
+A reviewer flagged "no dedicated unit tests for url-validation.js"
+in this round — `test/url-validation.test.js` was added in 0.1.1
+with 19 tests; this release brings it to 28. Total file count is
+now 5 test files, 89 tests, all passing.
+
+### Compatibility
+
+Behavioural change: receivers that respond with HTTP redirects now
+surface as `502 receiver_unreachable` instead of the response of
+the redirect target. URLs returned by `resolveReceiver` should be
+final (no 3xx). Otherwise additive — port denylist and embedded-
+credentials check only fire for clearly-malicious URLs that legitimate
+deployments never produce.
+
 ## 0.1.1 — 2026-05-01
 
 Two external review rounds covering 12 + 7 findings respectively,

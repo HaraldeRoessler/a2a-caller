@@ -42,7 +42,13 @@ const PKCS8_HEADER = Buffer.from('302e020100300506032b657004220420', 'hex');
 export function loadSigningKey(seed) {
   let raw;
   if (typeof seed === 'string') {
-    raw = Buffer.from(seed.replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+    // replaceAll (not regex) to keep the b64url decode pattern
+    // consistent across the library — same hygiene fix as the
+    // 0.1.0+1 b64url encoder. Operator-supplied input today, but
+    // future refactors might pull this into an attacker-input
+    // path; keeping the pattern uniform avoids a copy-paste regex
+    // re-introducing a CodeQL js/polynomial-redos risk later.
+    raw = Buffer.from(seed.replaceAll('-', '+').replaceAll('_', '/'), 'base64');
   } else if (Buffer.isBuffer(seed)) {
     raw = seed;
   } else if (seed instanceof Uint8Array) {

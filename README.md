@@ -188,22 +188,69 @@ For HA deployments:
 
 ### SSRF allowlist
 
-The default validation blocks literal private/loopback IPs and
-non-https protocols. For production, also pass an
-`allowedReceiverHosts` allowlist scoped to your actual receiver
-domains:
+The default validation blocks:
+- Non-`https:` protocols
+- Literal private/loopback/link-local/cloud-metadata IPs (IPv4 + IPv6, including the fully-expanded form)
+- URLs with embedded credentials (`https://user:pw@host/...`)
+- Well-known internal-service ports (Redis 6379, PostgreSQL 5432, MongoDB 27017, kubelet 10250, etc. — full list in `src/url-validation.js`)
+- HTTP redirect responses from the receiver (`fetch` runs with `redirect: 'error'`)
+
+For production, also pass an `allowedReceiverHosts` allowlist
+scoped to your actual receiver domains:
 
 ```js
 publicChatMiddleware({
   // ...
   allowedReceiverHosts: ['*.ownify.ai', 'agent.example.com'],
+  // Optional: tight port allowlist (overrides the denylist above)
+  allowedReceiverPorts: [443, 8443],
 });
 ```
+
+**Allowlist semantics**:
+- Exact entries match the host literally (`agent.example.com` matches only `agent.example.com`).
+- Wildcard entries (`*.example.com`) match **any depth** of subdomain — `sub.example.com` AND `a.b.c.example.com`. They do NOT match the apex (`example.com` itself). This is consistent with browser cookie scoping. If you want to limit to a single subdomain depth, list the specific hosts explicitly.
 
 DNS-rebinding attacks (a hostname that resolves to a public IP at
 check-time, private IP at fetch-time) are NOT defended at this layer —
 mitigate with a forward proxy that re-validates per connection, or by
 resolving DNS once and passing a literal IP to fetch.
+
+### Request body mutation
+
+When `sanitise: true` (the default), `req.body` is **replaced in place**
+with the sanitised version. Any downstream Express middleware mounted
+on the same route will see the cleaned payload, not the raw one. Set
+`sanitise: false` if you need to preserve the original body.
+
+### Multi-replica rate-limiter
+
+The default `IpRateLimiter` is per-process. For HA deployments swap
+in a Redis-backed implementation with the same shape — only one method
+is required:
+
+```js
+const redisRateLimiter = {
+  consume: async (key) => {
+    // Atomically increment a per-key counter with a 60s expiry.
+    // Return false when the per-minute limit is exceeded.
+    const count = await redis.incr(`rl:${key}`);
+    if (count === 1) await redis.expire(`rl:${key}`, 60);
+    return count <= REQUESTS_PER_MINUTE;
+  },
+};
+
+publicChatMiddleware({
+  // ...
+  rateLimiter: redisRateLimiter,
+});
+```
+
+`IpRateLimiter.keyOf(ip, slug)` is exported as a helper if you want
+to re-use the same `(ip, slug)` JSON-encoded key shape. Until you
+swap in something multi-replica-aware, layer a CDN / reverse-proxy
+rate limit (Cloudflare, nginx `limit_req`) in front as the primary
+defence and treat the in-process limiter as best-effort.
 
 ## What's req.firewall (and what isn't)
 

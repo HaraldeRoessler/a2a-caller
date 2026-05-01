@@ -379,3 +379,73 @@ test('config validation: maxBodyBytes must be a positive integer', () => {
     /maxBodyBytes/,
   );
 });
+
+test('SSRF defence #2: receiver returning 302 redirect → 502 (not followed)', async () => {
+  const { seed } = freshKeypair();
+  const redirectingServer = createServer((_req, res) => {
+    res.statusCode = 302;
+    res.setHeader('Location', 'http://10.0.0.1/internal');
+    res.end();
+  });
+  await new Promise((r) => redirectingServer.listen(0, '127.0.0.1', r));
+  const { port } = redirectingServer.address();
+
+  const app = await startApp(publicChatMiddleware({
+    resolveReceiver: async () => ({
+      did: 'did:moltrust:t',
+      url: `http://127.0.0.1:${port}/api/a2a/message`,
+    }),
+    callerDid: 'did:moltrust:p',
+    signingKey: { key: loadSigningKey(seed) },
+    callerSigKeyId: 'caller-v1',
+    requestsPerMinute: 100,
+    allowPrivateHosts: true,
+    allowedProtocols: ['http:'],
+  }));
+
+  const r = await fetch(`${app.baseUrl}/v1/chat/x`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(r.status, 502, 'redirect must surface as receiver_unreachable, not be followed');
+  await app.close();
+  await new Promise((r) => redirectingServer.close(r));
+});
+
+test('response carries X-Content-Type-Options: nosniff', async () => {
+  const { seed, pubB64url } = freshKeypair();
+  const recv = await startMockReceiver(pubB64url, () => 'did:moltrust:t');
+  const app = await startApp(publicChatMiddleware({
+    resolveReceiver: async () => ({ did: 'did:moltrust:t', url: recv.url }),
+    callerDid: 'did:moltrust:p',
+    signingKey: { key: loadSigningKey(seed) },
+    callerSigKeyId: 'caller-v1',
+    requestsPerMinute: 100,
+    allowPrivateHosts: true,
+    allowedProtocols: ['http:'],
+  }));
+  const r = await fetch(`${app.baseUrl}/v1/chat/x`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(r.headers.get('x-content-type-options'), 'nosniff');
+  await app.close();
+  await recv.close();
+});
+
+test('SSRF defence: URL with embedded credentials → 404', async () => {
+  const { seed } = freshKeypair();
+  const app = await startApp(publicChatMiddleware({
+    resolveReceiver: async () => ({
+      did: 'did:moltrust:t',
+      url: 'https://user:pw@agent.example.com/api',
+    }),
+    callerDid: 'did:moltrust:p',
+    signingKey: { key: loadSigningKey(seed) },
+    callerSigKeyId: 'k',
+    requestsPerMinute: 100,
+  }));
+  const r = await fetch(`${app.baseUrl}/v1/chat/x`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.equal(r.status, 404);
+  await app.close();
+});

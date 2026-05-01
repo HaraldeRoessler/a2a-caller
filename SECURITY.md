@@ -12,9 +12,21 @@ three groups:
 - **SSRF via attacker-controlled receiver URLs** — `receiver.url` is
   parsed and validated before any `fetch()`. Default policy: https
   only, literal private/loopback/link-local/cloud-metadata IPs
-  rejected. Optional `allowedReceiverHosts` allowlist tightens to
-  exact hostnames or `*.example.com` wildcards. See README's
-  "Deployment requirements" for the DNS-rebinding caveat.
+  rejected (IPv4 and IPv6 including the fully-expanded `0:0:0:0:0:0:0:1`
+  form), URLs with embedded credentials rejected, well-known internal
+  service ports (Redis, PostgreSQL, MongoDB, kubelet, etc.) on the
+  port denylist. Optional `allowedReceiverHosts` allowlist tightens to
+  exact hostnames or `*.example.com` wildcards. Optional
+  `allowedReceiverPorts` allowlist locks outbound to specific ports.
+- **SSRF via HTTP redirects** — `fetch()` runs with `redirect: 'error'`
+  so a receiver that 3xx-redirects to a private IP cannot bypass
+  `validateReceiverUrl` (which only saw the initial URL). Receivers
+  must return their final URL from `resolveReceiver`.
+- **Browser MIME-sniffing of compromised receiver responses** —
+  `X-Content-Type-Options: nosniff` is hard-coded on every visitor
+  response so a receiver returning `Content-Type: text/plain` with
+  active content cannot be sniffed and executed by the visitor's
+  browser.
 - **Replay against another receiver** — `sub = receiver.did` is set
   on every envelope, the receiver-side `expectedSub` check rejects
   envelopes captured for one peer and replayed against another.

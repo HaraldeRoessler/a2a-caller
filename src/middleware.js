@@ -241,6 +241,12 @@ export function publicChatMiddleware(cfg) {
         },
         body: serializedBody,
         signal: ac.signal,
+        // SSRF defence #2: NEVER follow redirects. validateReceiverUrl
+        // ran against the URL we were handed; a 3xx Location pointing
+        // at a private IP / disallowed host would bypass that check
+        // entirely if we followed it. Receivers should return their
+        // final URL from resolveReceiver, never one that redirects.
+        redirect: 'error',
       });
       upstreamStatus = upstream.status;
       upstreamBody = await upstream.text();
@@ -268,7 +274,12 @@ export function publicChatMiddleware(cfg) {
     //    boundary, not the visitor's browser. Clamp the upstream
     //    status to a valid HTTP range; non-standard codes from a
     //    broken upstream become 502 rather than crashing res.status().
+    //    Hardcode X-Content-Type-Options: nosniff so a compromised /
+    //    misconfigured receiver returning text/html with active
+    //    content can't be MIME-sniffed and executed by the visitor's
+    //    browser.
     res.status(clampHttpStatus(upstreamStatus));
+    res.setHeader('X-Content-Type-Options', 'nosniff');
     const ct = upstream.headers.get('content-type');
     if (ct) res.setHeader('content-type', ct);
     res.send(upstreamBody);
