@@ -1,0 +1,188 @@
+# a2a-caller
+
+Sender-side counterpart to [a2a-acl](https://github.com/HaraldeRoessler/a2a-acl).
+Express middleware that lets unauthenticated web traffic — visitors,
+LLM sandboxes (Claude / ChatGPT / Cursor), third-party services —
+reach AAE-protected agent-to-agent endpoints. Your service signs
+envelopes on the visitor's behalf, captures their identity for audit,
+rate-limits per IP.
+
+Pair with a2a-acl on the receiver side and you have a full
+sender/receiver stack for letting public web traffic talk to
+agent-web peers without bypassing any of the security primitives.
+
+MIT, no runtime dependencies beyond `a2a-acl` itself (which is
+zero-dep). Express is a peer dep — works with Express 4 and 5.
+
+## What it gives you
+
+A single middleware factory that handles the whole pipeline per request:
+
+1. **Receiver lookup** — your callback maps `slug → { did, url }`.
+2. **Per-IP rate-limit** — sliding window per `(ip, slug)`. 429 on overflow.
+3. **Payload sanitisation** — strips prompt-injection markers (uses `a2a-acl`'s `sanitiseDeep`).
+4. **Caller-id capture** — `X-Caller-DID` (opt-in self-declaration) + server-derived visitor hash.
+5. **AAE envelope signing** — Ed25519, 5-minute lifetime, fresh nonce, cross-peer-replay defence built in.
+6. **Forward to receiver** — `POST receiver.url` with `X-AAE: <envelope>`.
+7. **Response stream-back** — receiver's response goes straight to the visitor.
+8. **Audit row** — fire-and-forget to your sink.
+
+## Why this exists
+
+The receiver-side `a2a-acl` library is "default deny on every inbound
+A2A call". Great for agent-to-agent traffic with established DIDs.
+But on the public web you have visitors — humans, LLMs, automation
+scripts — that don't have DIDs of their own (yet). Without a sender-side
+library you'd either skip authentication ("public path bypass") or
+roll your own envelope signer in every project.
+
+`a2a-caller` is the standard way to bridge the two: visitors hit a
+public endpoint, your portal signs as itself (its DID is a real
+MolTrust-or-equivalent identity with its own trust score), receivers
+treat the portal as a known peer with `message`-only capability.
+Visitors get audited via `X-Caller-DID` + visitor hash, so receivers
+can grant per-DID upgrades over time.
+
+## Install
+
+```sh
+npm install a2a-caller express
+```
+
+Requires Node 20+. Express is a peer dep.
+
+## Usage
+
+```js
+import express from 'express';
+import { publicChatMiddleware, loadSigningKey, IpRateLimiter } from 'a2a-caller';
+
+// 1. Load your signing key once at startup. The 32-byte Ed25519 seed
+//    lives in a Secret / KMS / file — never in source. Throws loudly
+//    if malformed (operator-time error, fail loud).
+const signingKey = { key: loadSigningKey(process.env.PORTAL_SIGNING_SEED) };
+
+// 2. Wire the middleware. Every callback is yours to define.
+const app = express();
+app.use(express.json({ limit: '64kb' }));
+
+app.post('/v1/chat/:slug', publicChatMiddleware({
+  // Where to find the receiver
+  resolveReceiver: async (slug) => {
+    const tenant = await db.tenants.findOne({ slug });
+    if (!tenant) return null;
+    return { did: tenant.moltrust_did, url: `https://a2a-${slug}.example.com/api/a2a/message` };
+  },
+
+  // Your portal's identity
+  callerDid: 'did:moltrust:my-portal-frontend-...',
+  signingKey,
+  callerSigKeyId: 'my-portal-v1',  // receiver's KeyResolver maps this → your pubkey
+
+  // Per-IP rate-limit (passed instance, OR pass requestsPerMinute and one is built lazily)
+  rateLimiter: new IpRateLimiter({ requestsPerMinute: 30 }),
+
+  // Optional audit sink
+  sink: (row) => db.public_chat_audit.insert(row),
+
+  // Optional pino-style logger
+  logger: console,
+}));
+
+app.listen(3000);
+```
+
+That's the whole shape. A complete working example is in
+[`examples/express-server.js`](./examples/express-server.js)
+(`npm run example` — it spins up both a portal AND a mock a2a-acl
+receiver so you can see the round-trip end to end).
+
+## What the visitor sends
+
+```sh
+curl -X POST https://your-portal.example.com/v1/chat/acme \
+     -H "Content-Type: application/json" \
+     -H "X-Caller-DID: did:moltrust:claude-sess-xyz" \   # optional, audit-only
+     -d '{"message": "Hi, can you tell me about your roadmap?"}'
+```
+
+`X-Caller-DID` is **audit-only**. The library shape-validates it
+(`did:method:id` regex, length cap) but does not cryptographically
+verify ownership. That's by design — visitors can't realistically
+sign envelopes the receiver would accept, and trying to fake that
+contract opens spoofing vectors. The visitor's *real* identity for
+authorization purposes is "the portal" (your `callerDid`); the
+`claimed_did` ends up in audit so receivers can graduate well-behaved
+visitor DIDs to per-DID ACL grants over time.
+
+## Strict defaults
+
+Same posture as a2a-acl: the strictest setting that doesn't break the
+common case is on by default.
+
+- **Envelope lifetime: 5 minutes**, hard-capped. A signer with a
+  longer `exp` gets rejected by the verifier; a caller passing
+  `lifetimeSec > 300` to `signEnvelope` throws at signing time.
+- **Cross-peer replay defence** — every envelope has `sub = receiver.did`,
+  so an envelope signed for receiver A can't be replayed against
+  receiver B (the receiver-side `expectedSub` rejects it).
+- **Per-IP rate limit fail-closed** when bucket cap exceeds — degraded
+  rate-limiting beats service denial.
+- **Bounded everything** — rate-limit buckets, header lengths, DID
+  shapes, oversized client labels collapse to null rather than
+  flow into audit.
+- **Sanitiser on by default** — strips known prompt-injection markers
+  before the envelope is built (so the signed payload is the
+  cleaned version).
+- **No request/response body in audit** — only metadata. Sensitive
+  payload contents stay out of the audit table by default.
+
+## What's req.firewall (and what isn't)
+
+This middleware is the SENDER side. It does not write to `req.firewall`
+(that's the receiver-side a2a-acl convention). Caller information is
+captured into a separate object the audit row references; if you
+need to inspect what the middleware would record, call
+`captureCallerId(req)` directly:
+
+```js
+import { captureCallerId } from 'a2a-caller';
+const callerId = captureCallerId(req);
+// → { claimed_did, client, visitor_hash }
+```
+
+## What's NOT in this library
+
+- **Authentication.** The whole point is unauth. If you want
+  Bearer-token / OAuth / session-based auth, mount it on a *different*
+  route — this library is for the deliberately-public path.
+- **Storage.** Your DB schema, your tables, your queries. The four
+  callbacks (`resolveReceiver`, `signingKey`, `sink`, optional
+  `getSlug` / `callerIdOpts.getSessionId`) are the contract.
+- **Multi-replica state.** Same constraint as a2a-acl — the per-IP
+  rate-limiter is in-process. For HA deployments running multiple
+  replicas, swap to a Redis-backed implementation with the same
+  interface (v0.2 if there's demand).
+- **Long-running streaming.** Each request is one POST → one response.
+  Server-Sent Events / WebSocket bridges to receivers are out of scope.
+- **The signing key.** You provide it. We never ship a default;
+  starting without `loadSigningKey(seed)` throws.
+
+## Cross-language signers
+
+This library imports `signablePayload` and `SIGNED_FIELDS` from
+`a2a-acl` and re-exports them. A signer in Python / Rust / Go can
+produce bit-identical envelopes by replicating the same allowlist
+and canonicalisation — see `a2a-acl`'s SECURITY.md for the spec.
+
+## Security
+
+See [SECURITY.md](./SECURITY.md) for the full threat model, the things
+this library does NOT defend against (network egress filtering,
+SQL injection in your `resolveReceiver` callback, prompt injection
+beyond known markers, multi-replica nonce reuse), and how to report
+a vulnerability.
+
+## License
+
+[MIT](./LICENSE).

@@ -1,0 +1,60 @@
+{
+  "name": "a2a-caller",
+  "version": "0.1.0",
+  "description": "Sender-side counterpart to a2a-acl. Express middleware that lets unauthenticated web traffic (visitors, LLM sandboxes, third-party services) reach AAE-protected agent-to-agent endpoints — your service signs envelopes on the visitor's behalf, captures their identity for audit, rate-limits per IP. Pair with a2a-acl on the receiver side.",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "example": "node examples/express-server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "a2a",
+    "agent-to-agent",
+    "aae",
+    "ed25519",
+    "envelope-signing",
+    "express-middleware",
+    "agent-web",
+    "public-chat",
+    "moltrust",
+    "ownify"
+  ],
+  "author": "Harald Roessler",
+  "license": "MIT",
+  "homepage": "https://github.com/HaraldeRoessler/a2a-caller",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HaraldeRoessler/a2a-caller.git"
+  },
+  "bugs": {
+    "url": "https://github.com/HaraldeRoessler/a2a-caller/issues"
+  },
+  "dependencies": {
+    "a2a-acl": "^0.1.4"
+  },
+  "peerDependencies": {
+    "express": "^4 || ^5"
+  },
+  "peerDependenciesMeta": {
+    "express": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "express": "^5.2.1"
+  }
+}
