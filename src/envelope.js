@@ -53,10 +53,15 @@ export function loadSigningKey(seed) {
 }
 
 function b64url(buf) {
+  // base64url-encode without regex padding-trim. Padding `=` is always
+  // at the end of base64 output, so replaceAll('=', '') is equivalent
+  // to /=+$/ here. Avoids CodeQL js/polynomial-redos noise on a regex
+  // that only ever sees crypto-output buffers (Ed25519 sigs, random
+  // jti, our own JSON), never attacker input.
   return Buffer.from(buf).toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
+    .replaceAll('+', '-')
+    .replaceAll('/', '_')
+    .replaceAll('=', '');
 }
 
 /**
